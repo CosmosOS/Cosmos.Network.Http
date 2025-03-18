@@ -1,6 +1,6 @@
-﻿/*
+/*
 * PROJECT:          CosmosHttp Development
-* CONTENT:          Base Http packet class (Heavily inspered by https://github.com/2881099/TcpClientHttpRequest)
+* CONTENT:          Base Http packet class
 * PROGRAMMERS:      Valentin Charbonnier <valentinbreiz@gmail.com>
 */
 
@@ -21,64 +21,56 @@ namespace CosmosHttp
 
         public HttpPacket()
         {
-            _headers = new Dictionary<string, string>();
+            _headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
         public string Method
         {
-            get
-            {
-                return _method;
-            }
-            set
-            {
-                _method = value.ToUpper();
-            }
+            get => _method;
+            set => _method = value.ToUpper();
         }
 
         public string Domain
         {
-            get
-            {
-                return _domain;
-            }
-            set
-            {
-                _domain = value;
-            }
+            get => _domain;
+            set => _domain = value;
         }
 
         public string IP
         {
-            get
-            {
-                return _ip;
-            }
-            set
-            {
-                _ip = value;
-            }
+            get => _ip;
+            set => _ip = value;
         }
 
         public string Charset
         {
-            get
-            {
-                return _charset;
-            }
-            set
-            {
-                _charset = value;
-            }
+            get => _charset;
+            set => _charset = value;
         }
 
-        public Dictionary<string, string> Headers
+        public Dictionary<string, string> Headers => _headers;
+
+        public string GetHeader(string name)
         {
-            get { return _headers; }
+            return _headers.TryGetValue(name, out string value) ? value : null;
+        }
+
+        public void SetHeader(string name, string value)
+        {
+            _headers[name] = value;
+        }
+
+        public void RemoveHeader(string name)
+        {
+            if (_headers.ContainsKey(name))
+            {
+                _headers.Remove(name);
+            }
         }
 
         public void Dispose()
         {
+            _headers.Clear();
         }
     }
 }

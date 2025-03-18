@@ -67,4 +67,4 @@ Give a ⭐️ if this project helped you!
 
 ## 📝 License
 
-Copyright © 2023 [CosmosOS](https://github.com/CosmosOS). This project is [BSD Clause 3](https://github.com/CosmosOS/CosmosHttp/blob/main/LICENSE.txt) licensed.
+Copyright © 2025 [CosmosOS](https://github.com/CosmosOS). This project is [BSD Clause 3](https://github.com/CosmosOS/CosmosHttp/blob/main/LICENSE.txt) licensed.

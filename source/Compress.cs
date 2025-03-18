@@ -1,14 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
+using System;
 using System.IO;
-using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace CosmosHttp
 {
     public static class GZip
     {
+        private const int BUFFER_SIZE = 4096;
+
         public static byte[] Decompress(Stream stream)
         {
             try
@@ -18,37 +17,56 @@ namespace CosmosHttp
                 {
                     using (Ionic.Zlib.GZipStream gzip = new Ionic.Zlib.GZipStream(stream, Ionic.Zlib.CompressionMode.Decompress))
                     {
-                        byte[] data = new byte[1024];
-                        int size = 0;
-                        while ((size = gzip.Read(data, 0, data.Length)) > 0)
+                        byte[] buffer = new byte[BUFFER_SIZE];
+                        int bytesRead;
+                        while ((bytesRead = gzip.Read(buffer, 0, buffer.Length)) > 0)
                         {
-                            ms.Write(data, 0, size);
+                            ms.Write(buffer, 0, bytesRead);
                         }
                     }
                     return ms.ToArray();
                 }
             }
-            catch { return (stream as MemoryStream).ToArray(); };
+            catch 
+            { 
+                return stream is MemoryStream memStream ? memStream.ToArray() : new byte[0]; 
+            }
         }
-        public static byte[] Decompress(byte[] bt)
+
+        public static byte[] Decompress(byte[] data)
         {
-            return Decompress(new MemoryStream(bt));
+            if (data == null || data.Length == 0)
+                return new byte[0];
+                
+            return Decompress(new MemoryStream(data));
         }
+
         public static byte[] Compress(string text)
         {
+            if (string.IsNullOrEmpty(text))
+                return new byte[0];
+                
             return Compress(Encoding.UTF8.GetBytes(text));
         }
-        public static byte[] Compress(byte[] bt)
+
+        public static byte[] Compress(byte[] data)
         {
-            return Compress(bt, 0, bt.Length);
+            if (data == null || data.Length == 0)
+                return new byte[0];
+                
+            return Compress(data, 0, data.Length);
         }
-        public static byte[] Compress(byte[] bt, int startIndex, int length)
+
+        public static byte[] Compress(byte[] data, int startIndex, int length)
         {
+            if (data == null || length <= 0 || startIndex < 0 || startIndex + length > data.Length)
+                return new byte[0];
+                
             using (MemoryStream ms = new MemoryStream())
             {
                 using (Ionic.Zlib.GZipStream gzip = new Ionic.Zlib.GZipStream(ms, Ionic.Zlib.CompressionMode.Compress))
                 {
-                    gzip.Write(bt, startIndex, length);
+                    gzip.Write(data, startIndex, length);
                 }
                 return ms.ToArray();
             }
@@ -57,6 +75,8 @@ namespace CosmosHttp
 
     public static class Deflate
     {
+        private const int BUFFER_SIZE = 4096;
+
         public static byte[] Decompress(Stream stream)
         {
             try
@@ -64,39 +84,58 @@ namespace CosmosHttp
                 stream.Position = 0;
                 using (MemoryStream ms = new MemoryStream())
                 {
-                    using (Ionic.Zlib.DeflateStream def = new Ionic.Zlib.DeflateStream(stream, Ionic.Zlib.CompressionMode.Decompress))
+                    using (Ionic.Zlib.DeflateStream deflate = new Ionic.Zlib.DeflateStream(stream, Ionic.Zlib.CompressionMode.Decompress))
                     {
-                        byte[] data = new byte[1024];
-                        int size = 0;
-                        while ((size = def.Read(data, 0, data.Length)) > 0)
+                        byte[] buffer = new byte[BUFFER_SIZE];
+                        int bytesRead;
+                        while ((bytesRead = deflate.Read(buffer, 0, buffer.Length)) > 0)
                         {
-                            ms.Write(data, 0, size);
+                            ms.Write(buffer, 0, bytesRead);
                         }
                     }
                     return ms.ToArray();
                 }
             }
-            catch { return (stream as MemoryStream).ToArray(); };
+            catch 
+            { 
+                return stream is MemoryStream memStream ? memStream.ToArray() : new byte[0];
+            }
         }
-        public static byte[] Decompress(byte[] bt)
+
+        public static byte[] Decompress(byte[] data)
         {
-            return Decompress(new MemoryStream(bt));
+            if (data == null || data.Length == 0)
+                return new byte[0];
+                
+            return Decompress(new MemoryStream(data));
         }
+
         public static byte[] Compress(string text)
         {
+            if (string.IsNullOrEmpty(text))
+                return new byte[0];
+                
             return Compress(Encoding.UTF8.GetBytes(text));
         }
-        public static byte[] Compress(byte[] bt)
+
+        public static byte[] Compress(byte[] data)
         {
-            return Compress(bt, 0, bt.Length);
+            if (data == null || data.Length == 0)
+                return new byte[0];
+                
+            return Compress(data, 0, data.Length);
         }
-        public static byte[] Compress(byte[] bt, int startIndex, int length)
+
+        public static byte[] Compress(byte[] data, int startIndex, int length)
         {
+            if (data == null || length <= 0 || startIndex < 0 || startIndex + length > data.Length)
+                return new byte[0];
+                
             using (MemoryStream ms = new MemoryStream())
             {
-                using (Ionic.Zlib.DeflateStream def = new Ionic.Zlib.DeflateStream(ms, Ionic.Zlib.CompressionMode.Compress))
+                using (Ionic.Zlib.DeflateStream deflate = new Ionic.Zlib.DeflateStream(ms, Ionic.Zlib.CompressionMode.Compress))
                 {
-                    def.Write(bt, startIndex, length);
+                    deflate.Write(data, startIndex, length);
                 }
                 return ms.ToArray();
             }

@@ -1,6 +1,6 @@
-﻿/*
+/*
 * PROJECT:          CosmosHttp Development
-* CONTENT:          Http Response class (Heavily inspered by https://github.com/2881099/TcpClientHttpRequest)
+* CONTENT:          Http Response class
 * PROGRAMMERS:      Valentin Charbonnier <valentinbreiz@gmail.com>
 */
 
@@ -19,25 +19,28 @@ namespace CosmosHttp.Client
         private string _server;
         private string _content;
         private string _contentEncoding = string.Empty;
-        private byte[] _stream = new byte[] { };
+        private byte[] _stream = new byte[0];
 
         public int Received
         {
-            get { return _received; }
-            internal set { _received = value; }
+            get => _received;
+            internal set => _received = value;
         }
 
         public string TransferEncoding
         {
-            get { return _headers["Transfer-Encoding"]; }
-            set { _headers["Transfer-Encoding"] = value; }
+            get => _headers.ContainsKey("Transfer-Encoding") ? _headers["Transfer-Encoding"] : null;
+            set => _headers["Transfer-Encoding"] = value;
         }
 
-        public int ContentLength
-        {
-            get { return _contentLength; }
-        }
+        public int ContentLength => _contentLength;
 
+        public HttpStatusCode StatusCode => _statusCode;
+
+        public string ContentType => _contentType;
+
+        public string Server => _server;
+        
         public string Content
         {
             get
@@ -50,83 +53,114 @@ namespace CosmosHttp.Client
             }
         }
 
-        public HttpResponse(HttpRequest ie, byte[] headBytes)
+        public HttpResponse(HttpRequest request, byte[] headBytes)
         {
-            _ip = ie.IP;
-            _method = ie.Method;
-            _charset = ie.Charset;
-            string head = Encoding.ASCII.GetString(headBytes);
-            _head = head = head.Trim();
+            _ip = request.IP;
+            _method = request.Method;
+            _charset = request.Charset;
+            
+            ParseResponseHeader(headBytes);
+        }
+
+        private void ParseResponseHeader(byte[] headBytes)
+        {
+            string head = Encoding.ASCII.GetString(headBytes).Trim();
+            _head = head;
+            
+            ParseStatusLine(ref head);
+            ParseHeaders(head);
+        }
+
+        private void ParseStatusLine(ref string head)
+        {
             int idx = head.IndexOf(' ');
             if (idx != -1)
             {
                 head = head.Substring(idx + 1);
-            }
-            idx = head.IndexOf(' ');
-            if (idx != -1)
-            {
-                _statusCode = (HttpStatusCode)int.Parse(head.Remove(idx));
-                head = head.Substring(idx + 1);
-            }
-            idx = head.IndexOf("\r\n");
-            if (idx != -1)
-            {
-                head = head.Substring(idx + 2);
-            }
-
-            string[] heads = head.Split(new string[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (string h in heads)
-            {
-                string[] nv = h.Split(new char[] { ':' }, 2);
-                if (nv.Length == 2)
+                
+                idx = head.IndexOf(' ');
+                if (idx != -1)
                 {
-                    string n = nv[0].Trim();
-                    string v = nv[1].Trim();
+                    _statusCode = (HttpStatusCode)int.Parse(head.Remove(idx));
+                    head = head.Substring(idx + 1);
+                }
+                
+                idx = head.IndexOf("\r\n");
+                if (idx != -1)
+                {
+                    head = head.Substring(idx + 2);
+                }
+            }
+        }
 
-                    // Handle specific headers and their unique cases
-                    switch (n.ToLower())
+        private void ParseHeaders(string headerText)
+        {
+            string[] headers = headerText.Split(new string[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+            
+            foreach (string header in headers)
+            {
+                string[] headerParts = header.Split(new char[] { ':' }, 2);
+                if (headerParts.Length == 2)
+                {
+                    string name = headerParts[0].Trim();
+                    string value = headerParts[1].Trim();
+                    
+                    ProcessHeader(name, value);
+                }
+            }
+        }
+
+        private void ProcessHeader(string name, string value)
+        {
+            switch (name.ToLower())
+            {
+                case "content-length":
+                    if (!int.TryParse(value, out _contentLength))
+                        _contentLength = -1;
+                    break;
+                    
+                case "content-type":
+                    _contentType = value;
+                    ProcessContentTypeCharset(value);
+                    break;
+                    
+                case "server":
+                    _server = value;
+                    break;
+                    
+                case "content-encoding":
+                    _contentEncoding = value;
+                    break;
+                    
+                default:
+                    if (_headers.ContainsKey(name))
                     {
-                        case "content-length":
-                            if (!int.TryParse(v, out _contentLength)) _contentLength = -1;
-                            break;
-                        case "content-type":
-                            _contentType = v;
-                            idx = v.IndexOf("charset=", StringComparison.OrdinalIgnoreCase);
-                            if (idx != -1)
-                            {
-                                string charset = v.Substring(idx + 8).Split(';')[0].Trim();
-                                if (string.Compare(_charset, charset, StringComparison.OrdinalIgnoreCase) != 0)
-                                {
-                                    try
-                                    {
-                                        Encoding testEncode = Encoding.GetEncoding(charset);
-                                        _charset = charset;
-                                    }
-                                    catch (Exception ex)
-                                    { 
-                                        Cosmos.HAL.Global.debugger.Send("Ex: " + ex.ToString());
-                                    }
-                                }
-                            }
-                            break;
-                        case "server":
-                            _server = v;
-                            break;
-                        case "content-encoding":
-                            _contentEncoding = v;
-                            break;
-                        // Add more specific headers as needed
-                        default:
-                            if (_headers.ContainsKey(n))
-                            {
-                                // Append or replace based on your requirement
-                                _headers[n] = v;
-                            }
-                            else
-                            {
-                                _headers.Add(n, v);
-                            }
-                            break;
+                        _headers[name] = value;
+                    }
+                    else
+                    {
+                        _headers.Add(name, value);
+                    }
+                    break;
+            }
+        }
+
+        private void ProcessContentTypeCharset(string contentType)
+        {
+            int charsetIndex = contentType.IndexOf("charset=", StringComparison.OrdinalIgnoreCase);
+            if (charsetIndex != -1)
+            {
+                string charset = contentType.Substring(charsetIndex + 8).Split(';')[0].Trim();
+                if (string.Compare(_charset, charset, StringComparison.OrdinalIgnoreCase) != 0)
+                {
+                    try
+                    {
+                        Encoding testEncode = Encoding.GetEncoding(charset);
+                        _charset = charset;
+                    }
+                    catch (Exception ex)
+                    {
+                        Cosmos.HAL.Global.debugger.Send("Ex: " + ex.ToString());
                     }
                 }
             }
@@ -134,8 +168,8 @@ namespace CosmosHttp.Client
 
         public void SetStream(byte[] bodyBytes)
         {
-            _stream = bodyBytes;
-            _contentLength = bodyBytes.Length;
+            _stream = bodyBytes ?? new byte[0];
+            _contentLength = _stream.Length;
         }
 
         public byte[] GetStream()
