@@ -287,14 +287,14 @@ public class HttpRequestTests
     }
 
     [Test]
-    public void RedirectToHttps_Throws()
+    public void RedirectToAnotherScheme_Throws()
     {
         using TestServer server = new();
-        server.Then("HTTP/1.1 301 Moved Permanently\r\nLocation: https://secure.example/\r\nContent-Length: 0\r\n\r\n");
+        server.Then("HTTP/1.1 301 Moved Permanently\r\nLocation: ftp://files.example/\r\nContent-Length: 0\r\n\r\n");
 
         HttpException exception = Assert.Throws<HttpException>(() => new HttpRequest(server.Url("/")) { Timeout = Timeout }.Send())!;
         Assert.That(exception.StatusCode, Is.EqualTo(301));
-        Assert.That(exception.Message, Does.Contain("TLS"));
+        Assert.That(exception.Message, Does.Contain("ftp://files.example/"));
     }
 
     [Test]
@@ -385,6 +385,6 @@ public class HttpRequestTests
         Assert.Throws<ArgumentOutOfRangeException>(() => _ = new HttpRequest("http://host/") { Timeout = 0 });
         Assert.Throws<ArgumentOutOfRangeException>(() => _ = new HttpRequest("http://host/") { MaxRedirects = -1 });
         Assert.Throws<ArgumentException>(() => _ = new HttpRequest(" "));
-        Assert.Throws<NotSupportedException>(() => _ = new HttpRequest("https://host/"));
+        Assert.Throws<NotSupportedException>(() => _ = new HttpRequest("ftp://host/"));
     }
 }
