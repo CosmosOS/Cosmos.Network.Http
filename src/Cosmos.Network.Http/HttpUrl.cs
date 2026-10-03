@@ -7,16 +7,22 @@ using System.Text;
 namespace Cosmos.Network.Http;
 
 /// <summary>
-/// An http:// URL taken apart into what a request needs: the host and port to
-/// connect to, and the target its request line names. The fragment is dropped,
-/// as it never leaves the client.
+/// An http:// or https:// URL taken apart into what a request needs: whether
+/// to talk TLS, the host and port to connect to, and the target its request
+/// line names. The fragment is dropped, as it never leaves the client.
 /// </summary>
 internal sealed class HttpUrl
 {
     /// <summary>The port of an http:// URL that names none.</summary>
     public const int DefaultPort = 80;
 
+    /// <summary>The port of an https:// URL that names none.</summary>
+    public const int DefaultSecurePort = 443;
+
     private const string HexDigits = "0123456789ABCDEF";
+
+    /// <summary>Whether this is an https:// URL, whose connection runs TLS.</summary>
+    public bool IsSecure { get; }
 
     /// <summary>The host name or address, an IPv6 literal without its brackets.</summary>
     public string Host { get; }
@@ -27,26 +33,30 @@ internal sealed class HttpUrl
     /// <summary>The path and query the request line names: at least <c>/</c>, percent-encoded where it has to be.</summary>
     public string Target { get; }
 
-    /// <summary>The host, and the port when it is not 80: what the Host header names.</summary>
+    /// <summary>The host, and the port when it is not the scheme's default one: what the Host header names.</summary>
     public string Authority { get; }
 
-    private HttpUrl(string host, int port, string target)
+    private HttpUrl(bool isSecure, string host, int port, string target)
     {
+        IsSecure = isSecure;
         Host = host;
         Port = port;
         Target = target;
 
         string name = host.Contains(':') ? "[" + host + "]" : host;
-        Authority = port == DefaultPort ? name : $"{name}:{port}";
+        Authority = port == (isSecure ? DefaultSecurePort : DefaultPort) ? name : $"{name}:{port}";
     }
 
-    public override string ToString() => "http://" + Authority + Target;
+    /// <summary><c>http</c> or <c>https</c>.</summary>
+    public string Scheme => IsSecure ? "https" : "http";
+
+    public override string ToString() => Scheme + "://" + Authority + Target;
 
     /// <summary>
     /// Takes apart an absolute URL. One without a scheme is an http:// URL, as
     /// wget takes it.
     /// </summary>
-    /// <exception cref="NotSupportedException">The URL is not an http:// one (there is no TLS, so not an https:// one either), or it carries credentials.</exception>
+    /// <exception cref="NotSupportedException">The URL is neither an http:// nor an https:// one, or it carries credentials.</exception>
     /// <exception cref="FormatException">The URL names no host, or a port that is not a TCP port.</exception>
     public static HttpUrl Parse(string url)
     {
@@ -58,18 +68,15 @@ internal sealed class HttpUrl
             rest = rest.Substring(0, fragment);
         }
 
+        bool isSecure = false;
         int schemeLength = SchemeLength(rest);
         if (schemeLength > 0)
         {
             string scheme = rest.Substring(0, schemeLength);
-            if (scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+            isSecure = scheme.Equals("https", StringComparison.OrdinalIgnoreCase);
+            if (!isSecure && !scheme.Equals("http", StringComparison.OrdinalIgnoreCase))
             {
-                throw new NotSupportedException($"{url} needs TLS, which is not supported: use http://.");
-            }
-
-            if (!scheme.Equals("http", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new NotSupportedException($"{url} is not an http:// URL.");
+                throw new NotSupportedException($"{url} is neither an http:// nor an https:// URL.");
             }
 
             rest = rest.Substring(schemeLength + 3);
@@ -119,7 +126,7 @@ internal sealed class HttpUrl
         }
 
         // An empty port ("host:/") is the default one (RFC 3986, section 3.2.3).
-        int port = DefaultPort;
+        int port = isSecure ? DefaultSecurePort : DefaultPort;
         if (!string.IsNullOrEmpty(portText)
             && (!int.TryParse(portText, NumberStyles.None, CultureInfo.InvariantCulture, out port) || port < 1 || port > 65535))
         {
@@ -131,13 +138,14 @@ internal sealed class HttpUrl
             target = "/" + target;
         }
 
-        return new HttpUrl(host, port, EncodeTarget(target));
+        return new HttpUrl(isSecure, host, port, EncodeTarget(target));
     }
 
     /// <summary>
     /// Resolves the Location of a redirect against this URL: an absolute URL,
-    /// a URL without a scheme (<c>//host/path</c>), an absolute path, a query,
-    /// or a path relative to this URL's directory.
+    /// a URL without a scheme (<c>//host/path</c>, which keeps this URL's
+    /// scheme), an absolute path, a query, or a path relative to this URL's
+    /// directory.
     /// </summary>
     /// <exception cref="NotSupportedException">The location is an absolute URL <see cref="Parse"/> does not support.</exception>
     /// <exception cref="FormatException">The location is an absolute URL <see cref="Parse"/> cannot take apart.</exception>
@@ -152,7 +160,7 @@ internal sealed class HttpUrl
 
         if (reference.StartsWith("//", StringComparison.Ordinal))
         {
-            return Parse("http:" + reference);
+            return Parse(Scheme + ":" + reference);
         }
 
         int fragment = reference.IndexOf('#');
@@ -181,7 +189,7 @@ internal sealed class HttpUrl
             _ => path.Substring(0, path.LastIndexOf('/') + 1) + reference,
         };
 
-        return new HttpUrl(Host, Port, EncodeTarget(target));
+        return new HttpUrl(IsSecure, Host, Port, EncodeTarget(target));
     }
 
     /// <summary>

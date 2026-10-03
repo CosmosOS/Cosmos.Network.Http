@@ -6,7 +6,8 @@ namespace Cosmos.Network.Http;
 
 /// <summary>
 /// A request that did not get a usable response: the host could not be
-/// resolved or reached, the server went silent or sent something that is not
+/// resolved or reached, the TLS handshake failed or the server's certificate
+/// is not trusted, the server went silent or sent something that is not
 /// HTTP, a redirect led nowhere, or <see cref="HttpResponse.EnsureSuccessStatusCode"/>
 /// found an error status.
 /// </summary>

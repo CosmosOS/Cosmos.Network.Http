@@ -1,0 +1,16 @@
+Cosmos.Network.Http embeds third-party material:
+
+resources/cacert.pem
+    Mozilla's root certificates (CA bundle), as extracted by the curl project
+    from Mozilla's certdata.txt: https://curl.se/docs/caextract.html
+    Embedded unmodified in the assembly as the resource
+    "Cosmos.Network.Http.cacert.pem".
+    License: Mozilla Public License, version 2.0
+    https://www.mozilla.org/MPL/2.0/
+    Source: https://hg.mozilla.org/mozilla-central/raw-file/tip/security/nss/lib/ckfw/builtins/certdata.txt
+
+The package also depends on, without embedding it:
+
+BouncyCastle.Cryptography
+    https://github.com/bcgit/bc-csharp
+    License: MIT
