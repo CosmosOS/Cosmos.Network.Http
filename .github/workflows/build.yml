@@ -1,0 +1,72 @@
+# Builds, tests and packs on every push and pull request. A tag named
+# v<version> (e.g. v2.0.1) also publishes that version to nuget.org through
+# Trusted Publishing: no API key is stored, the publish job trades GitHub's
+# OIDC token for a short-lived nuget.org key.
+#
+# The nuget.org Trusted Publishing policy matches on repository owner,
+# repository name, this file's name (build.yml) and, if it names one, the
+# `production` environment: renaming this file breaks publishing.
+
+name: Build
+
+on:
+  push:
+    branches: [main, gen3]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Test
+        run: dotnet test Cosmos.Network.Http.slnx -c Release
+
+      # On a release tag the tag names the version; otherwise the .csproj does.
+      - name: Pack
+        run: |
+          args=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            args+=("-p:Version=${GITHUB_REF_NAME#v}")
+          fi
+          dotnet pack src/Cosmos.Network.Http/Cosmos.Network.Http.csproj -c Release -o artifacts "${args[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write # lets NuGet/login request GitHub's OIDC token
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: nupkg
+          path: artifacts
+
+      - name: NuGet login
+        id: login
+        uses: NuGet/login@v1
+        with:
+          # The user who CREATED the policy, not the CosmosOS profile that owns
+          # it. nuget.org looks the policy up by creator and answers a wrong
+          # guess with "No matching trust policy owned by user 'CosmosOS' was
+          # found" (HTTP 401). Public, so not a secret.
+          user: valentinbreiz
+
+      - name: Push to nuget.org
+        run: dotnet nuget push "artifacts/*.nupkg" --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json
