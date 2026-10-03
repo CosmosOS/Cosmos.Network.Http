@@ -1,70 +1,90 @@
-﻿<h1 align="center">CosmosHTTP Client [WIP]</h1>
+<h1 align="center">CosmosHTTP Client 🚀</h1>
 <p>
-  <a href="https://www.nuget.org/packages/CosmosHttp/" target="_blank">
-    <img alt="Version" src="https://img.shields.io/nuget/v/CosmosHttp.svg" />
+  <a href="https://www.nuget.org/packages/Cosmos.Network.Http/" target="_blank">
+    <img alt="Version" src="https://img.shields.io/nuget/v/Cosmos.Network.Http.svg" />
   </a>
-  <a href="https://github.com/CosmosOS/CosmosHttp/blob/main/LICENSE.txt" target="_blank">
+  <a href="https://github.com/CosmosOS/Cosmos.Network.Http/blob/main/LICENSE.txt" target="_blank">
     <img alt="License: BSD Clause 3 License" src="https://img.shields.io/badge/license-BSD License-yellow.svg" />
   </a>
 </p>
 
-> CosmosHTTP is a HTTP client made in C# for the Cosmos operating system construction kit. GET and PUT are currently supported.
-
-### Todo
-See [this issue](https://github.com/CosmosOS/CosmosHttp/issues/1) for todo list.
+> CosmosHTTP is an HTTP/1.1 client made in C# for the Cosmos operating system construction kit.
 
 ## Usage
 
-### Installation
+Add the package to your kernel .csproj:
 
-Install the Nuget Package from [Nuget](https://www.nuget.org/packages/CosmosHttp/):
-
-```PM
-Install-Package CosmosHttp -Version 1.0.4
-```
-
-```PM
-dotnet add PROJECT package CosmosHttp --version 1.0.4
-```
-
-Or add these lines to your Cosmos kernel .csproj:
-
-```
+```xml
 <ItemGroup>
-    <PackageReference Include="CosmosHttp" Version="1.0.4" />
+    <PackageReference Include="Cosmos.Network.Http" Version="2.0.0" />
 </ItemGroup>
 ```
 
-### Examples
+The kernel needs networking (`CosmosEnableNetwork`, on by default), an IP configuration (DHCP or static) and, for host names, a DNS server. `Send()` runs the request on the calling thread and returns the response once it has arrived whole:
 
-```CS
-using CosmosHttp.Client;
+```csharp
+using System;
+using System.IO;
+using Cosmos.Network.Http;
 
-HttpRequest request = new();
-request.IP = "34.223.124.45";
-request.Domain = "neverssl.com"; //very useful for subdomains on same IP
-request.Path = "/";
-request.Method = "GET";
-request.Send();
-Console.WriteLine(request.Response.Content); // or to get bytes Encoding.ASCII.getString(request.Response.GetStream())
+HttpResponse response = new HttpRequest("http://httpforever.com/").Send();
+
+Console.WriteLine($"{response.StatusCode} {response.ReasonPhrase}, {response.Content.Length} bytes");
+File.WriteAllBytes("/0/index.html", response.Content);
 ```
 
-Here is a basic wget command implementation using CosmosHttp: [github.com/aura-systems/Aura-Operating-System](https://github.com/aura-systems/Aura-Operating-System/blob/master/SRC/Aura_OS/System/Interpreter/Commands/Network/Wget.cs#L63).
+`Send()` returns error statuses too; `EnsureSuccessStatusCode()` turns them into an `HttpException`, and `GetString()` decodes the body with the charset of its Content-Type:
+
+```csharp
+string json = new HttpRequest("http://example.com/data.json").Send().EnsureSuccessStatusCode().GetString();
+```
+
+A request can set its method, body, headers, timeout and how many redirects it follows:
+
+```csharp
+HttpResponse response = new HttpRequest("http://example.com/api")
+{
+    Method = "POST",
+    Body = Encoding.UTF8.GetBytes("{\"name\":\"cosmos\"}"),
+    Headers = { ["Content-Type"] = "application/json" },
+    Timeout = 10_000,  // how long the server may stay silent, in milliseconds (15 s by default)
+    MaxRedirects = 0,  // return redirects instead of following them (5 by default)
+    // Optional: one line per response and redirect.
+    Log = message => Cosmos.Kernel.System.Diagnostics.Log.WriteString(message + "\n"),
+}.Send();
+```
+
+The Host header comes from the URL. Setting it in `Headers` reaches a virtual host by IP address:
+
+```csharp
+new HttpRequest("http://34.223.124.45/") { Headers = { ["Host"] = "neverssl.com" } }.Send();
+```
+
+### Limits
+
+- `http://` only: there is no TLS, so `https://` URLs, and redirects to them, throw.
+- Each request opens a connection of its own, and the server closes it once it has answered.
+- Responses come without content coding (`Accept-Encoding: identity`): a Cosmos kernel has no gzip to undo.
+- The whole body is held in memory.
+
+### Threads
+
+`Send()` never waits in `Thread.Sleep`: it waits in `Socket.Poll`, which returns at once on a Cosmos kernel. So it runs on the kernel's main loop, which must never block, as well as on a thread of its own.
 
 ## Authors
 
 👤 **[@valentinbreiz](https://github.com/valentinbreiz)**
 
-👤 **[@2881099](https://github.com/2881099)**
+👤 **[@2881099](https://github.com/2881099)** (the first version was inspired by [TcpClientHttpRequest](https://github.com/2881099/TcpClientHttpRequest))
 
 ## 🤝 Contributing
 
-Contributions, issues and feature requests are welcome! Feel free to check [issues page](https://github.com/CosmosOS/CosmosHttp/issues). 
+Contributions, issues and feature requests are welcome!
 
-## Show your support
-
-Give a ⭐️ if this project helped you!
+Feel free to check [issues page](https://github.com/CosmosOS/Cosmos.Network.Http/issues).
 
 ## 📝 License
 
-Copyright © 2023 [CosmosOS](https://github.com/CosmosOS). This project is [BSD Clause 3](https://github.com/CosmosOS/CosmosHttp/blob/main/LICENSE.txt) licensed.
+Copyright © 2023-2026 [CosmosOS](https://github.com/CosmosOS).
+
+This project is [BSD Clause 3](https://github.com/CosmosOS/Cosmos.Network.Http/blob/main/LICENSE.txt) licensed.
