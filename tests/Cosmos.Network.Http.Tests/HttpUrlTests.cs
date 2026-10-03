@@ -19,6 +19,9 @@ public class HttpUrlTests
     [TestCase("  http://host/a  ", "host", 80, "/a")]
     [TestCase("http://[::1]:8000/", "::1", 8000, "/")]
     [TestCase("host/search?u=http://other/", "host", 80, "/search?u=http://other/")]
+    [TestCase("https://example.com/", "example.com", 443, "/")]
+    [TestCase("HTTPS://example.com:8443/a?b", "example.com", 8443, "/a?b")]
+    [TestCase("https://host:/a", "host", 443, "/a")]
     public void Parse_TakesTheUrlApart(string url, string host, int port, string target)
     {
         HttpUrl parsed = HttpUrl.Parse(url);
@@ -31,12 +34,33 @@ public class HttpUrlTests
         });
     }
 
+    [TestCase("http://host/", false)]
+    [TestCase("host/", false)]
+    [TestCase("https://host/", true)]
+    [TestCase("HtTpS://host/", true)]
+    public void Parse_TellsWhetherTheUrlIsSecure(string url, bool isSecure)
+    {
+        Assert.That(HttpUrl.Parse(url).IsSecure, Is.EqualTo(isSecure));
+    }
+
     [TestCase("http://host/", "host")]
     [TestCase("http://host:8080/", "host:8080")]
     [TestCase("http://[::1]:8080/", "[::1]:8080")]
+    [TestCase("http://host:443/", "host:443")]
+    [TestCase("https://host:443/", "host")]
+    [TestCase("https://host:80/", "host:80")]
+    [TestCase("https://[::1]/", "[::1]")]
     public void Authority_LeavesOutTheDefaultPort(string url, string authority)
     {
         Assert.That(HttpUrl.Parse(url).Authority, Is.EqualTo(authority));
+    }
+
+    [TestCase("https://Host/a", "https://Host/a")]
+    [TestCase("https://host:443/a", "https://host/a")]
+    [TestCase("https://host:8443", "https://host:8443/")]
+    public void ToString_WritesTheUrlOutInFull(string url, string expected)
+    {
+        Assert.That(HttpUrl.Parse(url).ToString(), Is.EqualTo(expected));
     }
 
     [Test]
@@ -46,15 +70,10 @@ public class HttpUrlTests
         Assert.That(HttpUrl.Parse("http://host/a%20b").Target, Is.EqualTo("/a%20b"));
     }
 
-    [Test]
-    public void Parse_RefusesHttps()
-    {
-        NotSupportedException exception = Assert.Throws<NotSupportedException>(() => HttpUrl.Parse("https://host/"))!;
-        Assert.That(exception.Message, Does.Contain("TLS"));
-    }
-
     [TestCase("ftp://host/")]
+    [TestCase("wss://host/")]
     [TestCase("http://user:pass@host/")]
+    [TestCase("https://user@host/")]
     public void Parse_RefusesWhatItDoesNotSupport(string url)
     {
         Assert.Throws<NotSupportedException>(() => HttpUrl.Parse(url));
@@ -87,9 +106,19 @@ public class HttpUrlTests
         Assert.That(url.Resolve(location).ToString(), Is.EqualTo(expected));
     }
 
-    [Test]
-    public void Resolve_RefusesHttps()
+    [TestCase("http://host/a", "https://other/b", "https://other/b")]
+    [TestCase("https://host/a", "http://other/b", "http://other/b")]
+    [TestCase("https://host/a", "//other/b", "https://other/b")]
+    [TestCase("https://host:8443/a/b", "c", "https://host:8443/a/c")]
+    [TestCase("https://host/a", "/c?d", "https://host/c?d")]
+    public void Resolve_KeepsOrChangesTheScheme(string url, string location, string expected)
     {
-        Assert.Throws<NotSupportedException>(() => HttpUrl.Parse("http://host/").Resolve("https://host/"));
+        Assert.That(HttpUrl.Parse(url).Resolve(location).ToString(), Is.EqualTo(expected));
+    }
+
+    [Test]
+    public void Resolve_RefusesOtherSchemes()
+    {
+        Assert.Throws<NotSupportedException>(() => HttpUrl.Parse("https://host/").Resolve("ftp://host/"));
     }
 }
