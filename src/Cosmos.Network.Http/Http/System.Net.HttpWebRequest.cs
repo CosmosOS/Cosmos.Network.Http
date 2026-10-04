@@ -1,0 +1,2165 @@
+//
+// Copyright (c) .NET Foundation and Contributors
+// Portions Copyright (c) Microsoft Corporation.  All rights reserved.
+// See LICENSE file in the project root for full license information.
+//
+
+namespace Cosmos.Network.Http
+{
+    using System;
+    using System.Collections;
+    using System.IO;
+    using System.Net.Security;
+    using System.Net.Sockets;
+    using System.Security.Cryptography.X509Certificates;
+    using System.Text;
+    using System.Threading;
+    using System.Diagnostics;
+
+    /// <summary>
+    /// This is the class that we use to create HTTP and requests.
+    /// Used to register prefix "http" with WEB Request class.
+    /// </summary>
+    internal class HttpRequestCreator : IWebRequestCreate
+    {
+        internal HttpRequestCreator()
+        {
+        }
+
+        /// <summary>
+        /// Creates an HttpWebRequest. We register
+        /// for http, https, ws and wss URLs, and this method is called when a request
+        /// needs to be created for one of those.
+        /// </summary>
+        /// <param name="Url">Url for request being created.</param>
+        /// <returns>The newly created HttpWebRequest.</returns>
+        public WebRequest Create(Uri Url)
+        {
+
+            return new HttpWebRequest(Url);
+        }
+
+    } // class HttpRequestCreator
+
+    /// <summary>
+    /// Provides an HTTP-specific implementation of the <see cref="WebRequest"/> class.
+    /// </summary>
+    /// <remarks>This class does the main work of the request: it collects the header information
+    /// from the user, exposes the Stream for outgoing entity data, and processes the incoming
+    /// request.</remarks>
+    public class HttpWebRequest : WebRequest
+    {
+
+        /// <summary>
+        /// Array list of connected streams.
+        /// This is static list, keeps all "stay live" sockets.
+        /// </summary>
+        internal static ArrayList m_ConnectedStreams;
+
+        // Cosmos: no timer to drop the connections left idle (nanoFramework's m_DropOldConnectionsTimer): each new
+        // connection drops them first. A Timer runs its callback on thread pool threads, whose stacks a Cosmos kernel
+        // never frees, and against sockets the request thread uses, which Cosmos's network stack doesn't lock.
+
+        /// <summary>
+        /// If a response was created then Dispose on the Request will not dispose the underlying stream.
+        /// </summary>
+        private bool m_responseCreated;
+
+        /// <summary>
+        /// Timer callback. Called periodically and closes all connections that
+        /// are idle for long time.
+        /// </summary>
+        /// <param name="unused">Unused</param>
+        static private void CheckPersistentConnections(object unused)
+        {
+            // Persistent connections have not been properly implemented yet.
+            int count = m_ConnectedStreams.Count;
+
+            // The fastest way to exit out - if there are no sockets in the list - exit out.
+            if (count > 0)
+            {
+                DateTime curTime = DateTime.UtcNow;
+                ArrayList expired = null;
+
+                lock (m_ConnectedStreams)
+                {
+                    count = m_ConnectedStreams.Count;
+
+                    for (int i = count - 1; i >= 0; i--)
+                    {
+                        InputNetworkStreamWrapper streamWrapper = (InputNetworkStreamWrapper)m_ConnectedStreams[i];
+
+                        // Cosmos: not one in use, whose m_lastUsed tells when it was lent, not when it was last used.
+                        if (streamWrapper.m_InUse)
+                        {
+                            continue;
+                        }
+
+                        TimeSpan timePassed = curTime - streamWrapper.m_lastUsed;
+
+                        // If the socket is old, then close and remove from the list.
+                        if (timePassed.TotalMilliseconds > HttpConstants.DefaultKeepAliveMilliseconds)
+                        {
+                            m_ConnectedStreams.RemoveAt(i);
+
+                            (expired ??= new ArrayList()).Add(streamWrapper);
+                        }
+                    }
+
+                }
+
+                // Cosmos: closed out of the lock, which a Cosmos kernel doesn't release while an exception unwinds.
+                for (int i = 0; expired != null && i < expired.Count; i++)
+                {
+                    // Closes the socket to release resources.
+                    DisposeQuietly((InputNetworkStreamWrapper)expired[i]);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Cosmos: disposes a pooled connection, which may be closed or reset already.
+        /// </summary>
+        private static void DisposeQuietly(InputNetworkStreamWrapper stream)
+        {
+            try
+            {
+                stream.Dispose();
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>
+        /// Registers <itemref>HttpRequestCreator</itemref> as the creator for the "http" prefix.
+        /// </summary>
+        static HttpWebRequest()
+        {
+            // The static constructor of the base class does not get called before the derived static constructor
+            // so you have to make sure the base class gets initialized in any case if you want to use "RegisterPrefix"
+            Initialize();
+
+            // Creates instance of HttpRequestCreator. HttpRequestCreator creates HttpWebRequest
+            HttpRequestCreator Creator = new HttpRequestCreator();
+
+            // Register prefix. HttpWebRequest handles both http and https
+            RegisterPrefix("http:", Creator);
+            RegisterPrefix("https:", Creator);
+
+            if (m_ConnectedStreams == null)
+            {
+                // Creates new list for connected sockets.
+                m_ConnectedStreams = new ArrayList();
+            }
+        }
+
+        /// <summary>
+        /// Closes a response stream, if present.
+        /// </summary>
+        /// <param name="disposing">Not used.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (m_requestStream != null)
+            {
+                if (!m_responseCreated)
+                {
+                    RemoveStreamFromPool(m_requestStream);
+
+                    m_requestStream.Dispose();
+                }
+            }
+
+            base.Dispose(disposing);
+        }
+
+
+        /// <summary>
+        /// The length in KB of the default maximum for response headers
+        /// received.
+        /// </summary>
+        /// <remarks>
+        /// The default configuration file sets this value to 4 kilobytes.
+        /// </remarks>
+        static int defaultMaxResponseHeadersLen = 4;
+
+        /// <summary>
+        ///  Default delay on the Stream.Read and Stream.Write operations
+        /// </summary>
+        private const int DefaultReadWriteTimeout = 5 * 60 * 1000; // 5 minutes
+
+        /// <summary>
+        ///  Delegate that can be called on Continue Response
+        /// </summary>
+        private HttpContinueDelegate m_continueDelegate;
+
+        /// <summary>
+        /// HTTP verb.
+        /// </summary>
+        private string m_method;
+
+        /// <summary>
+        /// The Headers for the HTTP request.
+        /// </summary>
+        private WebHeaderCollection m_httpRequestHeaders;
+
+        /// <summary>
+        /// Controls how writes are handled.
+        /// </summary>
+        private HttpWriteMode m_httpWriteMode;
+
+        /// <summary>
+        /// The URI that we do the request for.
+        /// </summary>
+        private Uri m_originalUrl;
+
+        /// <summary>
+        /// Content length of the request message on POST.
+        /// </summary>
+        private long m_contentLength;
+
+        /// <summary>
+        /// The HTTP version for this request.
+        /// </summary>
+        private Version m_version;
+
+        /// <summary>
+        /// Timeout for Read And Write on the Stream that we return through
+        /// GetResponse().GetResponseStream() and GetRequestStream()
+        /// </summary>
+        private int m_readWriteTimeout;
+
+        /// <summary>
+        /// Proxy to use for connection.
+        /// </summary>
+        private IWebProxy m_proxy;
+
+        /// <summary>
+        /// Select <see cref="SslProtocol"/> to be used for requests. The default is <see cref="SslProtocol.None"/> to force setting it.
+        /// </summary>
+        private SslProtocols m_sslProtocols = SslProtocols.None;
+
+        /// <summary>
+        /// Whether to use persistent connections.
+        /// </summary>
+        private bool m_keepAlive;
+
+        /// <summary>
+        /// An array of certificates used to verify servers that support https.
+        /// </summary>
+        /// <remarks>
+        /// The client application sets these certificates to the
+        /// <b>HttpWebRequest</b>.  When the server certificate is received, it
+        /// is validated with certificates in this array.
+        /// </remarks>
+        X509Certificate m_caCert;
+
+        /// <summary>
+        /// Client certificate used to authenticate with server.
+        /// </summary>
+        internal X509Certificate _clientCert;
+
+        /// <summary>
+        /// The number of people using the connection.  Must reference-count this
+        /// stuff.  Except reference counting is apparently insufficient.  I'm going to flag each section
+        /// that uses the parser with a constant, and twiddle the flags for
+        /// adding and removing connections.
+        /// </summary>
+        internal const int k_noConnection = 0x0;
+        private const int k_parserFlag = 0x1;
+        private const int k_writeStreamFlag = 0x2;
+        private const int k_readStreamFlag = 0x4;
+        private const int k_abortFlag = 0x8;
+        internal int m_connectionUsers = 0;
+
+        /// <summary>
+        /// Static instance of decoder to convert received bytes from network
+        /// stream into text of the response line and WEB headers.
+        /// </summary>
+        static private Decoder UTF8decoder = System.Text.Encoding.UTF8.GetDecoder();
+
+        /// <summary>
+        /// Invalid characters that cannot be found in a valid method-verb.
+        /// </summary>
+        private static readonly char[] k_invalidMethodChars =
+        new char[]{' ',
+            '\r',
+            '\t',
+            '\n'};
+
+        /// <summary>
+        /// Exposes this property from <see cref="SslStream.SslVerification"/>.
+        /// </summary>
+        private SslVerification _sslVerification;
+
+        /// <summary>
+        /// The maximum length, in kilobytes (1024 bytes), of the response
+        /// headers.
+        /// </summary>
+        private int m_maxResponseHeadersLen = defaultMaxResponseHeadersLen;
+
+        /// <summary>
+        /// The response from the server.
+        /// </summary>
+        private HttpStatusCode m_responseStatus = (HttpStatusCode)0;
+
+        /// <summary>
+        /// true if we have a response, or a transport error while constructing the response
+        /// </summary>
+        private bool m_responseComplete = false;
+
+        /// <summary>
+        /// This is non-null if there was an error.  If this is true, then there is no valid HttpWebResponse.
+        /// </summary>
+        private WebException m_errorResponse = null;
+
+        /// <summary>
+        /// Buffer size for reading from the server
+        /// </summary>
+        private const int k_readBlockLength = 2048;
+
+        /// <summary>
+        /// This is the maximum amount of data which can be buffered at any time
+        /// and have a failed match.  In other words, if we receive this much
+        /// data, and can't parse it in any useful way, assume an error.
+        /// </summary>
+        private const int k_maximumBufferSize = 8192;
+
+        /// <summary>
+        /// True if the request has been started, false otherwise.  Disables
+        /// setting of many header properties.
+        /// </summary>
+        private bool m_requestSent;
+
+        /// <summary>
+        /// This is the request stream, if it has been created.
+        /// </summary>
+        private InputNetworkStreamWrapper m_requestStream;
+
+        /// <summary>
+        /// Whether or not data should be buffered when sent.
+        /// Data is always buffered though (given redirects and stuff).
+        /// </summary>
+        private bool m_allowWriteStreamBuffering;
+
+        /// <summary>
+        /// The timeout value for this request.
+        /// </summary>
+        private int m_timeout;
+
+        /// <summary>
+        /// Keep NetworkCredential if user have send user name and password.
+        /// </summary>
+        private NetworkCredential m_NetworkCredentials;
+
+        /// <summary>
+        /// Gets or sets the timeout value in milliseconds for the
+        /// <see cref="GetResponse"/> and
+        /// <see cref="GetRequestStream"/> methods.
+        /// </summary>
+        /// <value>The number of milliseconds to wait before the request times
+        /// out.  The default is 100,000 milliseconds (100 seconds).</value>
+        /// <remarks>
+        /// Overrides the <see cref="WebRequest.Timeout"/> property
+        /// of <itemref>WebRequest</itemref>.</remarks>
+        public override int Timeout
+        {
+            get
+            {
+                return m_timeout;
+            }
+
+            set
+            {
+                if (value < 0 && value != System.Threading.Timeout.Infinite)
+                {
+                    throw new ArgumentOutOfRangeException("value");
+                }
+
+                m_timeout = value;
+            }
+        }
+
+        /// <summary>
+        /// Set or Get NetworkCredential if user have send user name and password.
+        /// </summary>
+        public NetworkCredential Credentials
+        {
+            get { return m_NetworkCredentials; }
+            set { m_NetworkCredentials = value; }
+        }
+
+        /// <summary>
+        /// Gets or sets the root CA certificate used to authenticate with https
+        /// servers.  This certificate is used only for https connections;
+        /// http connections do not require this.
+        /// </summary>
+        public X509Certificate HttpsAuthentCert
+        {
+            get { return m_caCert; }
+            set { m_caCert = value; }
+        }
+
+        /// <summary>
+        /// Gets or sets 
+        /// </summary>
+        public SslVerification SslVerification
+        {
+            get { return _sslVerification; }
+            set { _sslVerification = value; }
+        }
+
+        /// <summary>
+        /// Gets or sets the TLS/SSL protocol used by the <see cref="HttpWebRequest"/> class.
+        /// </summary>
+        /// <value>
+        /// One of the values defined in the <see cref="Security.SslProtocols"/> enumeration.
+        /// </value>
+        /// <remarks>
+        /// Cosmos: SslProtocols.None (the default) offers TLS 1.3 and 1.2; nanoFramework required a value for HTTPS.
+        /// 
+        /// This property is specific to nanoFramework. There is no equivalent in the .NET API.
+        /// </remarks>
+        public SslProtocols SslProtocols
+        {
+            get { return m_sslProtocols; }
+            set { m_sslProtocols = value; }
+        }
+
+        /// <summary>
+        /// Gets or sets a timeout in milliseconds when writing to or reading
+        /// from a stream.
+        /// </summary>
+        /// <value>The number of milliseconds before the writing or reading
+        /// times out.  The default value is 300,000 milliseconds (5 minutes).
+        /// </value>
+        /// <remarks>This property is used to control the timeout when calling
+        /// <see cref="Stream.Read(byte[], int, int)"/> and <see cref="Stream.Write"/>.
+        /// This property affects <itemref>Stream</itemref>s returned from
+        /// GetResponse().<see cref="WebResponse.GetResponseStream"/>()
+        /// and
+        /// GetResponse().<see cref="GetRequestStream"/>().
+        /// </remarks>
+        public int ReadWriteTimeout
+        {
+            get
+            {
+                return m_readWriteTimeout;
+            }
+
+            set
+            {
+                // we can't change timeouts after the request has been sent
+                if (m_requestSent)
+                    throw new InvalidOperationException("Cannot change timeout after request submitted ");
+                if (value <= 0 && value != System.Threading.Timeout.Infinite)
+                {
+                    throw new ArgumentOutOfRangeException("value");
+                }
+
+                m_readWriteTimeout = value;
+            }
+        }
+
+        /// <summary>
+        /// The HTTP status code returned by the server.
+        /// </summary>
+        internal HttpStatusCode ResponseStatusCode
+        {
+            get
+            {
+                return m_responseStatus;
+            }
+        }
+
+        /// <summary>
+        /// Return if error is present in response.
+        /// </summary>
+        /// <returns>true if error happened, false otherwise</returns>
+        internal bool hasError()
+        {
+            return m_errorResponse != null;
+        }
+
+        /// <summary>
+        /// Gets the original Uniform Resource Identifier (URI) of the request.
+        /// </summary>
+        /// <remarks>
+        /// The URI object was created by the constructor and is always
+        /// non-null.  The URI object will always be the base URI, because
+        /// automatic re-directs aren't supported.
+        /// </remarks>
+        /// <value>A Uri that contains the URI of the Internet resource passed
+        /// to the WebRequest.<see cref="WebRequest.Create(Uri)"/> method.
+        /// </value>
+        public override Uri RequestUri
+        {
+            get
+            {
+                return m_originalUrl;
+            }
+        }
+
+        /// <summary>
+        /// Gets the URI for this request.
+        /// </summary>
+        /// <value>A <itemref>Uri</itemref> that identifies the Internet
+        /// resource that actually responds to the request.  The default is the
+        /// URI used by the
+        /// WebRequest.<see cref="WebRequest.Create(Uri)"/> method to
+        /// initialize the request.
+        /// </value>
+        /// <remarks>
+        /// This value is always the same as the
+        /// <see cref="RequestUri"/>
+        /// property, because automatic re-direction isn't supported.
+        /// </remarks>
+        public Uri Address
+        {
+            get
+            {
+                return m_originalUrl;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets a value that indicates whether to buffer the data sent
+        /// to the Internet resource.
+        /// </summary>
+        /// <value><itemref>true</itemref> to enable buffering of the data sent
+        /// to the Internet resource; <b>false</b> to disable buffering.  The
+        /// default is <b>true</b>.</value>
+        public bool AllowWriteStreamBuffering
+        {
+
+            get
+            {
+                return m_allowWriteStreamBuffering;
+            }
+
+            set
+            {
+                m_allowWriteStreamBuffering = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the <b>Content-Length</b> of the request entity body.
+        /// </summary>
+        /// <value>The number of bytes of data to send to the Internet resource.
+        /// The default is -1, which indicates the property has not been set and
+        /// that there is no request data to send.</value>
+        /// <remarks>
+        /// Getting this property returns the last value set, or -1 if no value
+        /// has been set.  Setting it sets the content length, and the
+        /// application must write that much data to the stream.  This property
+        /// interacts with
+        /// <b>HttpWebRequest</b>.<see cref="SendChunked"/>.
+        /// </remarks>
+        public override long ContentLength
+        {
+            get
+            {
+                return m_contentLength;
+            }
+
+            set
+            {
+                //no race.  Don't need interlocked
+                if (true == m_requestSent)
+                    throw new InvalidOperationException();
+
+                if (value < 0)
+                    throw new ArgumentOutOfRangeException("Content length cannot be negative: " + value);
+
+                m_contentLength = value;
+                //if a content length is set, then we cannot send chunked data.
+                m_httpWriteMode = HttpWriteMode.Write;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the delegate used to signal on Continue callback.
+        /// </summary>
+        /// <value>A delegate that implements the callback method that executes
+        /// when an HTTP Continue response is returned from the Internet
+        /// resource.  The default value is <b>null</b>.</value>
+        /// <remarks>
+        /// This property gets or sets the delegate method called when an HTTP
+        /// 100-continue response is received from the Internet resource.
+        /// </remarks>
+        public HttpContinueDelegate ContinueDelegate
+        {
+            get { return m_continueDelegate; }
+            set { m_continueDelegate = value; }
+        }
+
+        /// <summary>
+        /// Gets  a value that indicates whether the request should follow
+        /// redirection responses.  This value is always
+        /// <itemref>false</itemref>, because Autodirect isn't supported.
+        /// </summary>
+        /// <value>This value is always <itemref>false</itemref>, because
+        /// Autodirect isn't supported.</value>
+        public bool AllowAutoRedirect
+        {
+            get
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Gets the maximum number of automatic redirections.  This value is
+        /// always zero, because auto-redirection isn't supported.
+        /// </summary>
+        /// <value>This value is always zero, because auto-redirection isn't
+        /// supported.</value>
+        public int MaximumAutomaticRedirections
+        {
+            get
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the HTTP method of this request.
+        /// </summary>
+        /// <value>The request method to use to contact the Internet resource.
+        /// The default value is GET.</value>
+        /// <remarks>
+        /// This method represents the initial origin verb, which is unchanged
+        /// and unaffected by redirects.
+        /// </remarks>
+        public override string Method
+        {
+            get
+            {
+                return m_method;
+            }
+
+            set
+            {
+                if (ValidationHelper.IsBlankString(value))
+                {
+                    throw new ArgumentException("Blank Method Set: " + value);
+                }
+
+                if (value.IndexOfAny(k_invalidMethodChars) != -1)
+                {
+                    throw new ArgumentException("Invalid Method Set: " + value);
+                }
+
+                m_method = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets whether to use a persistent connection, if available.
+        /// </summary>
+        /// <value><b>true</b> if the request to the Internet resource should
+        /// contain a <b>Connection</b> HTTP header with the value Keep-alive;
+        /// otherwise, <b>false</b>.  The default is <b>true</b>.</value>
+        public bool KeepAlive
+        {
+            get
+            {
+                return m_keepAlive;
+            }
+
+            set
+            {
+                m_keepAlive = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the maximum allowed length of the response headers.
+        /// </summary>
+        /// <value>The length, in kilobytes (1024 bytes), of the response
+        /// headers.</value>
+        /// <remarks>
+        /// The length of the response header includes the response status line
+        /// and any extra control characters that are received as part of HTTP
+        /// protocol.  A value of -1 means no limit is imposed on the response
+        /// headers; a value of 0 means that all requests fail.  If this
+        /// property is not explicitly set, it defaults to the value of the
+        /// <see cref="DefaultMaximumResponseHeadersLength"/>
+        /// property.
+        /// </remarks>
+        public int MaximumResponseHeadersLength
+        {
+            get { return m_maxResponseHeadersLen; }
+            set
+            {
+                if (value <= 0 && value != -1)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+
+                m_maxResponseHeadersLen = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the default maximum allowed length of the response
+        /// headers.
+        /// </summary>
+        /// <value>The default maximum allowed length of the response headers.
+        /// </value>
+        /// <remarks>
+        /// On creation of an <itemref>HttpWebRequest</itemref> instance, this
+        /// value is used for the
+        /// <see cref="MaximumResponseHeadersLength"/>
+        /// property.
+        /// </remarks>
+        public static int DefaultMaximumResponseHeadersLength
+        {
+            get { return defaultMaxResponseHeadersLen; }
+            set
+            {
+                if (value <= 0 && value != -1)
+                {
+                    throw new ArgumentOutOfRangeException();
+                }
+                defaultMaxResponseHeadersLen = value;
+            }
+        }
+
+        /// <summary>
+        /// A collection of HTTP headers stored as name/value pairs.
+        /// </summary>
+        /// <value>A <b>WebHeaderCollection</b> that contains the name/value
+        /// pairs that make up the headers for the HTTP request.</value>
+        /// <remarks>
+        /// The following header values are set through properties on the
+        /// <itemref>HttpWebRequest</itemref> class: Accept, Connection,
+        /// Content-Length, Content-Type, Expect, Range, Referer,
+        /// Transfer-Encoding, and User-Agent.  Trying to set these header
+        /// values by using
+        /// <b>WebHeaderCollection.<see cref="WebHeaderCollection.Add(string, string)"/>()</b>
+        /// will raise an exception.  Date and Host are set internally.
+        /// </remarks>
+        public override WebHeaderCollection Headers
+        {
+            get
+            {
+                return m_httpRequestHeaders;
+            }
+
+            set
+            {
+                // we can't change headers after they've already been sent
+                if (m_requestSent)
+                    throw new InvalidOperationException("Cannot change headers after request submitted");
+
+                WebHeaderCollection webHeaders = value;
+                WebHeaderCollection newWebHeaders =
+                    new WebHeaderCollection(true);
+
+                // Copy And Validate -
+                // Handle the case where their object tries to change
+                // name, value pairs after they call set, so therefore,
+                // we need to clone their headers.
+                for (int i = 0; i < webHeaders.AllKeys.Length; i++)
+                {
+                    newWebHeaders.Add(webHeaders.AllKeys[i], webHeaders[webHeaders.AllKeys[i]]);
+                }
+
+                m_httpRequestHeaders = newWebHeaders;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the proxy for the request.
+        /// </summary>
+        /// <value>The <see cref="IWebProxy"/> object to use to proxy
+        /// the request.  <b>null</b> indicates that no proxy will be used.</value>
+        public override IWebProxy Proxy
+        {
+            get { return m_proxy; }
+            set
+            {
+                if (m_requestSent)
+                    throw new InvalidOperationException("Cannot change proxy after request submitted");
+                if (value == null)
+                    throw new ArgumentNullException();
+
+                m_proxy = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the state of chunk transfer send mode.
+        /// </summary>
+        /// <value><b>true</b> to send data to the Internet resource in
+        /// segments; otherwise, <b>false</b>.  The default value is
+        /// <b>false</b>.</value>
+        /// <remarks>
+        /// If <itemref>true</itemref>, bits are uploaded and written using the
+        /// <b>Chunked</b> property of <b>HttpWriteMode</b>.
+        /// </remarks>
+        public bool SendChunked
+        {
+            get { return m_httpWriteMode == HttpWriteMode.Chunked; }
+            set
+            {
+                //no race.  Don't need interlocked
+                if (true == m_requestSent)
+                {
+                    throw new InvalidOperationException("Cannot set \"chunked\" after request submitted");
+                }
+
+                if (value)
+                {
+                    m_httpWriteMode = HttpWriteMode.Chunked;
+                }
+                else
+                {
+                    if (m_contentLength >= 0)
+                    {
+                        m_httpWriteMode = HttpWriteMode.Write;
+                    }
+                    else
+                    {
+                        m_httpWriteMode = HttpWriteMode.None;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the HTTP protocol version for this request.
+        /// </summary>
+        /// <value>The HTTP version to use for the request.  The default is
+        /// <see cref="HttpVersion.Version11"/>.</value>
+        public Version ProtocolVersion
+        {
+            get
+            {
+                return m_version;
+            }
+
+            set
+            {
+                if (!value.Equals(HttpVersion.Version10) &&
+                    !value.Equals(HttpVersion.Version11))
+                {
+                    throw new ArgumentException("Invalid HTTP Verion: " + value);
+                }
+
+                m_version = new Version(value.Major, value.Minor);
+            }
+        }
+
+        /// <summary>
+        /// Private method for removing duplicate code which removes and adds
+        /// headers that are marked private.
+        /// </summary>
+        /// <param name="HeaderName">The name of the HTTP header.</param>
+        /// <param name="value">The value of the HTTP header.</param>
+        private void SetSpecialHeaders(String HeaderName, String value)
+        {
+            value = WebHeaderCollection.CheckBadChars(value, true);
+
+            m_httpRequestHeaders.RemoveInternal(HeaderName);
+            if (value != null && value.Length != 0)
+            {
+                m_httpRequestHeaders.AddInternal(HeaderName, value);
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the type of the entity body (the value of the content
+        /// type).
+        /// </summary>
+        /// <value>The value of the <b>Content-type</b> HTTP header.  The
+        /// default value is <b>null</b>.</value>
+        /// <remarks>
+        /// Setting to <b>null</b> clears the content-type.
+        /// </remarks>
+        public override String ContentType
+        {
+            get
+            {
+                return m_httpRequestHeaders[HttpKnownHeaderNames.ContentType];
+            }
+
+            set
+            {
+                SetSpecialHeaders(HttpKnownHeaderNames.ContentType, value);
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the <b>TransferEncoding</b> HTTP header.
+        /// </summary>
+        /// <value>The value of the <b>Transfer-encoding</b> HTTP header.  The
+        /// default value is <b>null</b>.</value>
+        /// <remarks>
+        /// <b>null</b> clears the transfer encoding except for the
+        /// <b>Chunked</b> setting.
+        /// </remarks>
+        public String TransferEncoding
+        {
+            get
+            {
+                return m_httpRequestHeaders[HttpKnownHeaderNames.TransferEncoding];
+            }
+
+            set
+            {
+                bool fChunked;
+
+                // on blank string, remove current header
+                if (ValidationHelper.IsBlankString(value))
+                {
+                    // if the value is blank, then remove the header
+                    m_httpRequestHeaders.RemoveInternal(HttpKnownHeaderNames.TransferEncoding);
+
+                    return;
+                }
+
+                // if not, check if the user is trying to set chunked:
+                string newValue = value.ToLower();
+
+                fChunked = (newValue.IndexOf("chunked") != -1);
+
+                // prevent them from adding chunked, or from adding an Encoding
+                // without turing on chunked, the reason is due to the HTTP
+                // Spec which prevents additional encoding types from being
+                // used without chunked
+                if (fChunked)
+                {
+                    throw new ArgumentException("Cannot add \"Encoding\" and set \"chunked\"");
+                }
+                else if (m_httpWriteMode != HttpWriteMode.Chunked)
+                {
+                    throw new InvalidOperationException("Need HttpWriteMode.Chunked to be current mode");
+                }
+                else
+                {
+                    m_httpRequestHeaders.CheckUpdate(HttpKnownHeaderNames.TransferEncoding, value);
+                }
+            }
+
+        }
+
+        /// <summary>
+        /// Gets or sets the value of the <b>Accept</b> HTTP header.
+        /// </summary>
+        /// <value>The value of the <b>Accept</b> HTTP header.  The default
+        /// value is <b>null</b>.</value>
+        public String Accept
+        {
+            get { return m_httpRequestHeaders[HttpKnownHeaderNames.Accept]; }
+            set { SetSpecialHeaders(HttpKnownHeaderNames.Accept, value); }
+        }
+
+        /// <summary>
+        /// Gets or sets the value of the <b>Referer</b> HTTP header.
+        /// </summary>
+        /// <value>The value of the <b>Referer</b> HTTP header.  The default
+        /// value is <b>null</b>.</value>
+        /// <remarks>This header value is misspelled intentionally.</remarks>
+        public String Referer
+        {
+            get { return m_httpRequestHeaders[HttpKnownHeaderNames.Referer]; }
+            set
+            {
+                SetSpecialHeaders(HttpKnownHeaderNames.Referer, value);
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the value of the <b>User-Agent</b> HTTP header.
+        /// </summary>
+        /// <value>The value of the <b>User-agent</b> HTTP header.  The default
+        /// value is <b>null</b>.</value>
+        public String UserAgent
+        {
+            get { return m_httpRequestHeaders[HttpKnownHeaderNames.UserAgent]; }
+            set
+            {
+                SetSpecialHeaders(HttpKnownHeaderNames.UserAgent, value);
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the value of the <b>Expect</b> HTTP header.
+        /// </summary>
+        /// <value>The contents of the <b>Expect</b> HTTP header.  The default
+        /// value is <b>null</b>.</value>
+        /// <remarks>When setting this property, <b>null</b> clears the
+        /// <b>Expect</b> (except for the 100-continue value).</remarks>
+        public String Expect
+        {
+            get { return m_httpRequestHeaders[HttpKnownHeaderNames.Expect]; }
+            set
+            {
+                // on blank string, remove current header
+                if (ValidationHelper.IsBlankString(value))
+                {
+                    m_httpRequestHeaders.RemoveInternal(HttpKnownHeaderNames.Expect);
+                    return;
+                }
+
+                m_httpRequestHeaders.CheckUpdate(HttpKnownHeaderNames.Expect, value);
+            }
+        }
+
+        /// <summary>
+        /// Gets the <itemref>IfModifiedSince</itemref> value of
+        /// <itemref>HttpKnownHeaderNames</itemref>.
+        /// </summary>
+        /// <value>A <see cref="DateTime"/> that contains the contents of
+        /// the <b>If-Modified-Since</b> HTTP header.  The default value is the
+        /// current date and time.</value>
+        /// <remarks>
+        /// The setter for this property isn't supported, because a function
+        /// that formats the time isn't implemented.
+        /// <para>
+        /// <b>null</b> clears the
+        /// <itemref>IfModifiedSince</itemref> header.</para>
+        /// </remarks>
+        public DateTime IfModifiedSince
+        {
+            get
+            {
+                string ifmodHeaderValue = m_httpRequestHeaders[HttpKnownHeaderNames.IfModifiedSince];
+
+                if (ifmodHeaderValue == null)
+                {
+                    return DateTime.UtcNow;
+                }
+
+                return HttpProtocolUtils.string2date(ifmodHeaderValue);
+            }
+
+            // Set is not supported at this moment.  It is needed for server.
+            //set
+            //{
+            //    SetSpecialHeaders(HttpKnownHeaderNames.IfModifiedSince,
+            //                      HttpProtocolUtils.date2string(value));
+            //}
+        }
+
+        /// <summary>
+        /// Constructs an instance of the HTTP Protocol class and initalizes it
+        /// to the basic header state.
+        /// </summary>
+        /// <param name="Url">The Url object for which we're creating.</param>
+        internal HttpWebRequest(Uri Url)
+        {
+            m_requestSent = false;
+            m_originalUrl = Url;
+            SendChunked = false;
+            m_keepAlive = true;
+            m_httpRequestHeaders = new WebHeaderCollection(
+                true,
+                Url.Scheme == Uri.UriSchemeWs || Url.Scheme == Uri.UriSchemeWss);
+            m_httpWriteMode = HttpWriteMode.None;
+
+            m_contentLength = -1;
+            m_version = HttpVersion.Version11;
+
+            m_allowWriteStreamBuffering = false;
+
+            Method = "GET";
+
+            m_timeout = WebRequest.DefaultTimeout;
+            m_readWriteTimeout = DefaultReadWriteTimeout;
+
+            // set the default proxy initially (this can be overriden by the Proxy property)
+            m_proxy = WebRequest.DefaultWebProxy;
+
+            m_responseCreated = false;
+        }
+
+        /// <summary>
+        /// Reset
+        /// </summary>
+        public void Reset()
+        {
+            m_requestSent = false;
+            m_responseCreated = false;
+            m_contentLength = -1;
+            m_httpWriteMode = HttpWriteMode.None;
+            m_httpRequestHeaders = new WebHeaderCollection(true);
+        }
+
+        /// <summary>
+        /// Gets whether a response has been received from an Internet resource.
+        /// </summary>
+        /// <value><b>true</b> if a response has been received; otherwise,
+        /// <b>false</b>.</value>
+        public bool HaveResponse
+        {
+            get { return (m_responseComplete); }
+        }
+
+        /// <summary>
+        /// Adds a byte range header to the request for a specified range.
+        /// </summary>
+        /// <param name="from">The start of the range.</param>
+        /// <param name="to">The end of the range.</param>
+        public void AddRange(int from, int to)
+        {
+            AddRange("bytes", from, to);
+        }
+
+        /// <summary>
+        /// Adds a range header to a request for a specific range from the
+        /// beginning or end of the requested data.
+        /// </summary>
+        /// <param name="range">Start of the range.  The end of the range is the
+        /// end of the existing data.</param>
+        public void AddRange(int range)
+        {
+            AddRange("bytes", range);
+        }
+
+        /// <summary>
+        /// Adds a range header to a request for a specified range.
+        /// </summary>
+        /// <param name="rangeSpecifier">The description of the range, such as
+        /// "bytes".</param>
+        /// <param name="from">The start of the range.</param>
+        /// <param name="to">The end of the range.</param>
+        /// <remarks>
+        /// <paramref name="rangeSpecifier"/> would normally be
+        /// specified as "bytes", since this is the only range specifier
+        /// recognized by most HTTP servers.  Setting
+        /// <paramref name="rangeSpecifier"/> to some other string allows
+        /// support for custom range specifiers other than bytes.  The
+        /// byte-range specifier is defined in RFC 2616 by the IETF.</remarks>
+        public void AddRange(string rangeSpecifier, int from, int to)
+        {
+
+            // Do some range checking before assembling the header
+            if ((from < 0) || (to < 0) || (from > to))
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+
+            // Add it
+            if (!AddRange(rangeSpecifier, from.ToString(), to.ToString()))
+            {
+                throw new InvalidOperationException();
+            }
+        }
+
+        /// <summary>
+        /// Adds a range header to a request for a specific range from the
+        /// beginning or end of the requested data.
+        /// </summary>
+        /// <param name="rangeSpecifier">The description of the range, such as
+        /// "bytes".</param>
+        /// <param name="range">The range value.</param>
+        public void AddRange(string rangeSpecifier, int range)
+        {
+            if (!AddRange(rangeSpecifier, range.ToString(), (range >= 0) ? "" : null))
+            {
+                throw new InvalidOperationException();
+            }
+        }
+
+        /// <summary>
+        /// Adds or extends a range header.
+        /// </summary>
+        /// <param name="rangeSpecifier">Range specifier</param>
+        /// <param name="from">Start of range</param>
+        /// <param name="to">End of range</param>
+        /// <returns>TBD</returns>
+        /// <remarks>
+        /// Various range types can be specified via
+        /// <paramref name="rangeSpecifier"/>, but only one type of Range
+        /// request will be made; for example, a byte-range request, or a
+        /// row-range request.  Range types cannot be mixed.
+        /// </remarks>
+        private bool AddRange(string rangeSpecifier, string from, string to)
+        {
+            // Checks for NULL rangeSpecifier
+            if (rangeSpecifier == null)
+            {
+                throw new ArgumentNullException();
+            }
+
+            // Checks for Valid characters in rangeSpecifier
+            if (!WebHeaderCollection.IsValidToken(rangeSpecifier))
+            {
+                throw new ArgumentException();
+            }
+
+            // Add range specifier or appends to existing one
+            string curRange = m_httpRequestHeaders[HttpKnownHeaderNames.Range];
+
+            if ((curRange == null) || (curRange.Length == 0))
+            {
+                curRange = rangeSpecifier + "=";
+            }
+            else
+            {
+                if (String.Compare(curRange.Substring(0, curRange.IndexOf('=')), rangeSpecifier) != 0)
+                {
+                    return false;
+                }
+
+                curRange = string.Empty;
+            }
+
+            curRange += from.ToString();
+            if (to != null)
+            {
+                curRange += "-" + to;
+            }
+
+            m_httpRequestHeaders.SetAddVerified(HttpKnownHeaderNames.Range, curRange);
+            return true;
+        }
+
+        /// <summary>
+        /// This function is called first in GetRequestStream() and throws exception
+        /// if conditions are not correct.
+        /// </summary>
+        private void ValidateGetRequestStream()
+        {
+            // TransferEncoding is set to a value and SendChunked is false.
+            if (TransferEncoding != null && SendChunked == false)
+            {
+                throw new InvalidOperationException();
+            }
+
+            // ProtocolViolationException The Method property is GET or HEAD.
+            if (m_method == "GET" || m_method == "HEAD")
+            {
+                throw new ProtocolViolationException("HTTP Method is incorrect: " + Method);
+            }
+
+            // Condition for exception - KeepAlive is true, AllowWriteStreamBuffering is false,
+            // ContentLength is -1, SendChunked is false.
+            if (m_method == "PUT" || m_method == "POST")
+            {
+                if (ContentLength == -1 && SendChunked == false)
+                {
+                    throw new ProtocolViolationException("Content length must be present for this request");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Updates the HTTP WEB header collection to prepare it for request.
+        /// </summary>
+        private void PrepareHeaders()
+        {
+            // Depending on protocol version we update HTTP headers collection.
+            if (!(m_version.Equals(HttpVersion.Version10)))
+            {
+                if (m_httpWriteMode == HttpWriteMode.Write)
+                {
+                    m_httpRequestHeaders.ChangeInternal(HttpKnownHeaderNames.ContentLength, m_contentLength.ToString());
+                }
+                else if (m_httpWriteMode == HttpWriteMode.Chunked)
+                {
+                    m_httpRequestHeaders.AddInternal(HttpKnownHeaderNames.TransferEncoding, "chunked");
+                }
+
+                // Set keepAlive header, we always send it, do not rely in defaults.
+                // Do not override it, if it's already in the request. This is used for websockets to request the upgrade of the connection
+                // Otherwise: we send "Connection:Close" or "Connection:Keep-Alive"
+                if (m_httpRequestHeaders[HttpKnownHeaderNames.Connection] == null)
+                {
+                    string connectionValue;
+                    if (m_keepAlive)
+                    {
+                        // According to RFC, should be lower case
+                        connectionValue = "keep-alive";
+                    }
+                    else
+                    {
+                        // According to RFC, should be lower case
+                        connectionValue = "close";
+                    }
+
+                    m_httpRequestHeaders.ChangeInternal(HttpKnownHeaderNames.Connection, connectionValue);
+                }
+            }
+
+            //1.0 path
+            else
+            {
+                //1.0 doesn't support chunking
+                SendChunked = false;
+
+                //1.0 doesn't support keep alive
+                m_keepAlive = false;
+
+                if (m_httpWriteMode == HttpWriteMode.Write)
+                {
+                    m_httpRequestHeaders.ChangeInternal(HttpKnownHeaderNames.ContentLength, m_contentLength.ToString());
+                }
+            }
+
+            // Cosmos: the authority, with a port other than the scheme's (RFC 9112, 3.2), where nanoFramework sends the host
+            // alone: a server on port 8080 would read port 80.
+            m_httpRequestHeaders.ChangeInternal(HttpKnownHeaderNames.Host, m_originalUrl.Authority);
+
+            // Adds user name and password for basic Http authentication.
+            if (m_NetworkCredentials != null && m_NetworkCredentials.AuthenticationType == AuthenticationType.Basic)
+            {   // If credentials are supplied, we need to add header like "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+                // where QWxhZGRpbjpvcGVuIHNlc2FtZQ== is b64 encoded user name and password orginating as username:password.
+                string userInfo = "";
+                if (m_NetworkCredentials.UserName != null)
+                {
+                    userInfo += m_NetworkCredentials.UserName;
+                }
+
+                userInfo += ":";
+                if (m_NetworkCredentials.Password != null)
+                {
+                    userInfo += m_NetworkCredentials.Password;
+                }
+
+                // Encode user info.
+                byte[] buffer = Encoding.UTF8.GetBytes(userInfo);
+                string userNameAndPassEncoded = buffer != null ? Convert.ToBase64String(buffer) : "";
+                string authValue = "Basic " + userNameAndPassEncoded;
+                m_httpRequestHeaders.ChangeInternal(HttpKnownHeaderNames.Authorization, authValue);
+            }
+
+            m_requestSent = true;
+        }
+
+        /// <summary>
+        /// Removes the given stream from the connection pool
+        /// </summary>
+        internal static void RemoveStreamFromPool(InputNetworkStreamWrapper stream)
+        {
+            lock (m_ConnectedStreams)
+            {
+                if (m_ConnectedStreams.Contains(stream))
+                {
+                    m_ConnectedStreams.Remove(stream);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns network stream connected to server. It could be a proxy or a
+        /// real server Uri.
+        /// </summary>
+        /// <param name="proxyServer">Uri that describes the proxy server.</param>
+        /// <param name="targetServer">Uri that describes the target (real) server.</param>
+        /// <returns>Nerwork stream connected to server.</returns>
+        private InputNetworkStreamWrapper EstablishConnection(Uri proxyServer, Uri targetServer)
+        {
+            InputNetworkStreamWrapper retStream = null;
+
+            // Cosmos: what nanoFramework's m_DropOldConnectionsTimer does.
+            CheckPersistentConnections(null);
+
+            // Create a socket and set reuse true.
+            // But before creating new socket we look in the list of existing sockets. If socket for this host already
+            // exist - use it. No need to create new socket.
+            string remoteServer = targetServer.Host + ":" + targetServer.Port;
+            string connectionKey = ConnectionKey(targetServer);
+            ArrayList removeStreamList = new ArrayList();
+            lock (m_ConnectedStreams)
+            {
+
+                for (int i = 0; i < m_ConnectedStreams.Count; i++)
+                {
+                    InputNetworkStreamWrapper inputStream = (InputNetworkStreamWrapper)m_ConnectedStreams[i];
+
+                    if (inputStream.m_rmAddrAndPort == connectionKey && !inputStream.m_InUse)
+                    {
+                        // Re-use the connected socket.
+                        // But first we need to know that socket is not closed.
+                        try
+                        {
+                            // Non-blocking liveness check: Available == 0 after a ready SelectRead poll means the peer closed the connection.
+                            // Cosmos: and one no longer connected is dead too: Cosmos's Poll says nothing of a socket
+                            // closed on this side, and one the peer closed is not connected even with data left.
+                            bool peerClosed = !inputStream.m_Socket.Connected
+                                || (inputStream.m_Socket.Poll(0, SelectMode.SelectRead) && inputStream.m_Socket.Available == 0);
+                            if (!peerClosed)
+                            {
+                                // No exception, good we can condtinue and re-use connected stream.
+                                // Control flow returning here means we're now using a persistent connection. 
+                                inputStream.m_InUse = true;
+                                inputStream.m_lastUsed = DateTime.UtcNow;
+
+                                retStream = inputStream;
+                                break;
+                            }
+                            else
+                            {
+                                removeStreamList.Add(inputStream);
+                            }
+                        }
+                        catch (Exception)
+                        {
+                            removeStreamList.Add(inputStream);
+                        }
+
+                    }
+                }
+
+                for (int i = 0; i < removeStreamList.Count; i++)
+                {
+                    InputNetworkStreamWrapper removeStream = (InputNetworkStreamWrapper)removeStreamList[i];
+
+                    // Means socket was closed. Remove it from the list.
+                    m_ConnectedStreams.Remove(removeStream);
+                }
+            }
+
+            // Cosmos: closed out of the lock, which a Cosmos kernel doesn't release while an exception unwinds.
+            for (int i = 0; i < removeStreamList.Count; i++)
+            {
+                DisposeQuietly((InputNetworkStreamWrapper)removeStreamList[i]);
+            }
+
+            if (retStream == null)
+            {
+                // No persistent connection found. Need to establish new one.
+                IPAddress address = null;
+                UriHostNameType hostNameType = proxyServer.HostNameType;
+                if (hostNameType == UriHostNameType.IPv4)
+                {
+                    // Cosmos: TryParse, as Cosmos's IPAddress.Parse returns null rather than throwing.
+                    if (!IPAddress.TryParse(proxyServer.Host, out address))
+                    {
+                        throw new WebException("Invalid IPv4 address: " + proxyServer.Host, WebExceptionStatus.NameResolutionFailure);
+                    }
+                }
+                else if (hostNameType == UriHostNameType.Dns)
+                {
+                    IPHostEntry hostEntry = null;
+
+                    try
+                    {
+                        hostEntry = Dns.GetHostEntry(proxyServer.Host);
+                    }
+                    catch (SocketException se)
+                    {
+                        throw new WebException("host not available", se, WebExceptionStatus.ConnectFailure, null);
+                    }
+
+                    // Cosmos: the first IPv4 address, as nanoFramework's resolver returns no other; .NET's may list IPv6
+                    // ones first, which an IPv4 socket can't reach.
+                    int addressListSize = hostEntry.AddressList.Length;
+                    for (int i = 0; i < addressListSize; i++)
+                    {
+                        IPAddress candidate = hostEntry.AddressList[i];
+                        if (candidate != null && candidate.AddressFamily == AddressFamily.InterNetwork)
+                        {
+                            address = candidate;
+                            break;
+                        }
+                    }
+
+                    if (address == null)
+                    {
+                        throw new WebException("Unable to resolve Dns entry to valid IPv4 Address", WebExceptionStatus.NameResolutionFailure);
+                    }
+                }
+                else
+                {
+                    throw new WebException("Only IPv4 or Dns host names allowed.");
+                }
+
+                // If socket was not found in waiting connections, then we create new one.
+                Socket socket = null;
+                socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
+                // Cosmos: no ReuseAddress, NoDelay nor KeepAlive option. Cosmos's sockets have no native handle for
+                // SetSocketOption to reach, and it faults on the null one (a kernel panic, which no catch stops).
+                // Cosmos's TCP sends every write at once and keeps no TIME_WAIT, which leaves those options nothing to do.
+
+                // Connect to remote endpoint
+                try
+                {
+                    IPEndPoint remoteEP = new IPEndPoint(address, proxyServer.Port);
+                    socket.Connect((EndPoint)remoteEP);
+                }
+                catch (Exception e)
+                {
+                    // Cosmos: any exception, as Cosmos's Connect throws a plain Exception where .NET throws a
+                    // SocketException.
+                    // need to close socket, otherwise this will cause an out of memory exception
+                    socket.Close();
+
+                    throw new WebException("connection failed", e, WebExceptionStatus.ConnectFailure, null);
+                }
+
+                bool isSecured = false;
+
+                if (m_originalUrl.Scheme == Uri.UriSchemeHttps
+                   || m_originalUrl.Scheme == Uri.UriSchemeWss)
+                {
+                    isSecured = true;
+                }
+
+                // We have a connected socket. Create request stream
+                retStream = new InputNetworkStreamWrapper(new NetworkStream(socket), socket, true, proxyServer.Host + ":" + proxyServer.Port);
+
+                // For Secured connectrions, proxy works differently
+                if (isSecured)
+                {
+                    try
+                    {
+                        // If proxy is set, then for https/wss we need to send "CONNECT" command to proxy.
+                        // Once this command is send, the socket from proxy works as if it is the socket to the destination server.
+                        if (proxyServer != targetServer)
+                        {
+                            String request = "CONNECT " + remoteServer + " HTTP/" + ProtocolVersion + "\r\n\r\n";
+                            Byte[] bytesToSend = Encoding.UTF8.GetBytes(request);
+                            retStream.Write(bytesToSend, 0, bytesToSend.Length);
+
+                            // Now proxy should respond with the connected status. If it is successul, then we are good to go.
+                            CoreResponseData respData = ParseHTTPResponse(retStream, m_keepAlive);
+                            if (respData.m_statusCode != (int)HttpStatusCode.OK)
+                            {
+                                throw new WebException("Proxy returned " + respData.m_statusCode, WebExceptionStatus.ConnectFailure);
+                            }
+                        }
+
+                        // Once connection established need to create secure stream and authenticate server.
+                        SslStream sslStream = new SslStream(retStream.m_Socket);
+
+                        sslStream.SslVerification = _sslVerification;
+
+                        // Throws exception if it fails
+                        sslStream.AuthenticateAsClient(m_originalUrl.Host, null, m_caCert, m_sslProtocols);
+
+                        // Changes the stream to SSL stream.
+                        retStream.m_Stream = sslStream;
+
+                        // Changes the address. Originally socket was connected to proxy, now as if it connected to m_originalUrl.Host on m_originalUrl.Port
+                        // Cosmos: with the TLS settings it was authenticated with (see ConnectionKey).
+                        retStream.m_rmAddrAndPort = ConnectionKey(m_originalUrl);
+                    }
+                    catch (Exception e)
+                    {
+                        // Proxy CONNECT failure or SSL handshake failure: retStream is not usable and
+                        // isn't referenced anywhere else yet, so it must be closed here or the socket leaks.
+                        retStream.Dispose();
+
+                        // Cosmos: a failed handshake as a WebException, which HttpClient reports as an
+                        // HttpRequestException, where nanoFramework let SslStream's exception through.
+                        if (e is WebException)
+                        {
+                            throw;
+                        }
+
+                        throw new WebException("The TLS connection to " + m_originalUrl.Host + " failed: " + e.Message, e,
+                            e is AuthenticationException ? WebExceptionStatus.TrustFailure : WebExceptionStatus.SecureChannelFailure, null);
+                    }
+                }
+
+                // Check keepAlive before creating a persistent connection
+                if (m_keepAlive)
+                {
+                    lock (m_ConnectedStreams)
+                    {
+                        m_ConnectedStreams.Add(retStream);
+                    }
+                }
+            }
+
+            return retStream;
+        }
+
+        /// <summary>
+        /// Cosmos: throws for a response ParseHTTPResponse couldn't read, which has no headers: nanoFramework went on with
+        /// it, to a null dereference (a kernel panic on Cosmos, not an exception).
+        /// </summary>
+        private static void ThrowIfMalformed(CoreResponseData respData)
+        {
+            if (respData.m_status != WebExceptionStatus.Success || respData.m_headers == null)
+            {
+                throw new WebException(respData.m_exceptionMessage ?? "The response couldn't be read.", respData.m_innerException, WebExceptionStatus.ServerProtocolViolation, null);
+            }
+        }
+
+        /// <summary>
+        /// Cosmos: what a pooled connection serves: a host and port, and for https the TLS settings it was authenticated
+        /// with, so that a request doesn't reuse a connection another request trusted under other certificates or
+        /// verification. nanoFramework's pool tells them by host and port only.
+        /// </summary>
+        private string ConnectionKey(Uri server)
+        {
+            string key = server.Host + ":" + server.Port;
+
+            if (server.Scheme == Uri.UriSchemeHttps || server.Scheme == Uri.UriSchemeWss)
+            {
+                key += " tls " + (int)m_sslProtocols + " " + (int)_sslVerification + " " + CertificateKey(m_caCert);
+            }
+
+            return key;
+        }
+
+        private static string CertificateKey(X509Certificate certificate)
+        {
+            byte[] raw = certificate?.GetRawCertData();
+            if (raw == null)
+            {
+                return "store";
+            }
+
+            // FNV-1a: the certificates' content, as each request may come with its own instance of the same one.
+            uint hash = 2166136261;
+            for (int i = 0; i < raw.Length; i++)
+            {
+                hash = (hash ^ raw[i]) * 16777619;
+            }
+
+            return raw.Length + "/" + hash.ToString("x8");
+        }
+
+        /// <summary>
+        /// Submits request to the WEB server.
+        /// </summary>
+        private void SubmitRequest()
+        {
+            // We have connected socket. Create request stream
+            // If proxy is set - connect to proxy server.
+            if (m_requestStream == null)
+            {
+                if (m_proxy == null)
+                {
+                    // Direct connection to target server.
+                    m_requestStream = EstablishConnection(m_originalUrl, m_originalUrl);
+                }
+                else
+                {
+                    // Connection through proxy. We create network stream connected to proxy
+                    Uri proxyUri = m_proxy.GetProxy(m_originalUrl);
+
+                    if (m_originalUrl.Scheme == Uri.UriSchemeHttps
+                        || m_originalUrl.Scheme == Uri.UriSchemeWss)
+                    {
+                        // For HTTPs we still need to know the target name to decide on persistent connection.
+                        m_requestStream = EstablishConnection(proxyUri, m_originalUrl);
+                    }
+                    else
+                    {
+                        // For normal HTTP all requests go to proxy
+                        m_requestStream = EstablishConnection(proxyUri, proxyUri);
+                    }
+                }
+            }
+            // Call EstablishConnection() for the case where (m_requestStream != null)   
+            // Look for a persistent connection
+            else
+            {
+                m_requestStream = EstablishConnection(m_originalUrl, m_originalUrl);
+            }
+
+
+
+            if (m_requestStream == null)
+            {
+                // Connection could not be established
+                m_requestSent = false;
+                return;
+            }
+
+            // We have connected stream. Set the timeout from HttpWebRequest
+            m_requestStream.WriteTimeout = m_readWriteTimeout;
+            m_requestStream.ReadTimeout = m_readWriteTimeout;
+
+            // Now we need to write headers. First we update headers.
+            PrepareHeaders();
+
+            // Now send request string and headers.
+            byte[] dataToSend = GetHTTPRequestData();
+
+#if DEBUG   // In debug mode print the request. It helps a lot to troubleshoot the issues.
+            int byteUsed, charUsed;
+            bool completed = false;
+            char[] charBuf = new char[dataToSend.Length];
+            UTF8decoder.Convert(dataToSend, 0, dataToSend.Length, charBuf, 0, charBuf.Length, true, out byteUsed, out charUsed, out completed);
+            string strSend = new string(charBuf);
+            Debug.WriteLine(strSend);
+#endif
+            // Writes this data to the network stream.
+            m_requestStream.Write(dataToSend, 0, dataToSend.Length);
+            m_requestSent = true;
+        }
+
+
+        /// <summary>
+        /// Reads and parses HTTP response from server.
+        /// After return of function HTTP response is read.
+        /// </summary>
+        /// <param name="inStream">Network stream connected to server.</param>
+        /// <param name="defaultKeepAlive">TBD</param>
+        /// <returns>CoreResponseData that describes server response.</returns>
+        private CoreResponseData ParseHTTPResponse(InputNetworkStreamWrapper inStream, bool defaultKeepAlive)
+        {
+            // CoreResponseData keeps all the information of the response.
+            CoreResponseData ret = new CoreResponseData();
+            // maximumHeadersLength is maximum total length of http header. Basically this is amount
+            // of memory used for headers.
+            int headersLength = m_maxResponseHeadersLen == -1 ? 0x7FFFFFFF : m_maxResponseHeadersLen * 1024;
+
+            ret.m_shouldClose = !defaultKeepAlive;
+            // Parse the request line.
+            string line = inStream.Read_HTTP_Line(HttpConstants.maxHTTPLineLength).Trim();
+
+            // Cutoff white spaces
+            int currentOffset = 0;
+            for (; currentOffset < line.Length && ' ' != line[currentOffset]; ++currentOffset) ;
+
+            // find HTTP version, read http/1.x
+            string httpVersionString = line.Substring(0, currentOffset).ToLower();
+            if (httpVersionString.Equals("http/1.1"))
+            {
+                ret.m_version = HttpVersion.Version11;
+            }
+            else if (httpVersionString.Equals("http/1.0"))
+            {
+                ret.m_version = HttpVersion.Version10;
+            }
+            else
+            {
+                ret.m_status = WebExceptionStatus.ServerProtocolViolation;
+                ret.m_exceptionMessage = "Unknown http version: " + httpVersionString;
+                return ret;
+            }
+
+            //advance to the status code
+            for (; currentOffset < line.Length && ' ' == line[currentOffset]; ++currentOffset) ;
+
+            // Read the status code
+            int codeStart = currentOffset;
+            for (; currentOffset < line.Length && ' ' != line[currentOffset]; ++currentOffset) ;
+            int statusCode = -1;
+            try
+            {
+                string statusCodeStr =
+                    line.Substring(codeStart,
+                                    currentOffset - codeStart);
+                statusCode = Convert.ToInt32(statusCodeStr);
+            }
+            catch (Exception e)
+            {
+                ret.m_status = WebExceptionStatus.ServerProtocolViolation;
+                ret.m_exceptionMessage = "Missing status code in HTTP reply";
+                ret.m_innerException = e;
+                return ret;
+            }
+
+            // If we get here - status code should be read.
+            ret.m_statusCode = statusCode;
+
+            // Advance to the status message.  The message is optional
+            // Cosmos: past the space, where nanoFramework's loop stopped on it: the reason phrase began with it.
+            for (; currentOffset < line.Length && ' ' == line[currentOffset]; ++currentOffset) ;
+            ret.m_statusDescription = line.Substring(currentOffset);
+
+            ret.m_headers = new WebHeaderCollection(true);
+            ret.m_chunked = false;
+            ret.m_contentLength = -1;
+
+            while ((line = inStream.Read_HTTP_Header(HttpConstants.maxHTTPLineLength)).Length > 0)
+            {
+                // line.Length is used for the header. Substruct it.
+                headersLength -= line.Length;
+                // If total length used for header is exceeded, we break
+                if (headersLength < 0)
+                {
+                    ret.m_status = WebExceptionStatus.ServerProtocolViolation;
+                    ret.m_exceptionMessage = "Headers size exceed limit";
+                    return ret;
+                }
+
+                // Now parse the header.
+                int sepIdx = line.IndexOf(':');
+                if (sepIdx == -1)
+                {
+                    ret.m_status = WebExceptionStatus.ServerProtocolViolation;
+                    ret.m_exceptionMessage = "Illegal header format: " + line;
+                    return ret;
+                }
+
+                string headerName = line.Substring(0, sepIdx);
+                string headerValue = line.Substring(sepIdx + 1).TrimStart(null);
+                string matchableHeaderName = headerName.ToLower();
+
+                ret.m_headers.AddInternal(headerName, headerValue);
+                if (matchableHeaderName.Equals("content-length"))
+                {
+                    try
+                    {
+                        ret.m_contentLength = Convert.ToInt32(headerValue);
+
+                        // set the response stream length for the input stream, so that an EOF will be read
+                        // if the caller tries to read base the response content length
+                        inStream.m_BytesLeftInResponse = ret.m_contentLength;
+                    }
+                    catch (Exception e)
+                    {
+                        ret.m_status =
+                            WebExceptionStatus.ServerProtocolViolation;
+                        ret.m_exceptionMessage = "Content length NAN: " + headerValue;
+                        ret.m_innerException = e;
+                        return ret;
+                    }
+                }
+                else if (matchableHeaderName.Equals("transfer-encoding"))
+                {
+                    if (headerValue.ToLower().IndexOf("chunked") != -1)
+                    {
+                        ret.m_chunked = true;
+                    }
+                }
+                else if (matchableHeaderName.Equals("connection"))
+                {
+                    if (headerValue.ToLower().IndexOf(HttpKnownHeaderValues.close) != -1)
+                    {
+                        ret.m_shouldClose = true;
+                    }
+                }
+            }
+            return ret;
+        }
+
+        /// <summary>
+        /// Event handler for the web request timeout.  This handler will be invoked if the response takes longer than the value
+        /// indicated by the property Timeout.
+        /// </summary>
+        /// <param name="arg"></param>
+        private void OnRequestTimeout(object arg)
+        {
+            if (m_requestStream != null && m_requestStream.m_Socket != null)
+            {
+                try
+                {
+                    // Close the socket to kill the operation
+                    m_requestStream.m_Socket.Close();
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    m_requestStream.m_InUse = false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns a response from an Internet resource.  Overrides the 
+        /// <itemref>WebRequest</itemref>.<see cref="WebRequest.GetResponse"/> 
+        /// method.
+        /// </summary>
+        /// <returns>The response from the Internet resource.</returns>
+        public override WebResponse GetResponse()
+        {
+            HttpWebResponse response = null;
+
+            try
+            {
+                // If response was not sent, Submit the request. 
+                if (!m_requestSent)
+                {
+                    SubmitRequest();
+                }
+
+                // Need to check m_requestSent after SubmitRequest()
+                if (!m_requestSent)
+                {
+                    return response;
+                }
+
+                CoreResponseData respData = null;
+
+                // reset the total response bytes for the new request.
+                m_requestStream.m_BytesLeftInResponse = -1;
+
+                // Cosmos: the Timeout bounds each wait for the response's head, in place of nanoFramework's timer that closes
+                // the socket from another thread once it elapses (a Timer runs on thread pool threads, whose stacks a
+                // Cosmos kernel never frees, and Cosmos's network stack has no locks). The head comes in time or the
+                // read throws.
+                int readTimeout = m_requestStream.ReadTimeout;
+                if (m_timeout != System.Threading.Timeout.Infinite && (readTimeout == System.Threading.Timeout.Infinite || m_timeout < readTimeout))
+                {
+                    m_requestStream.ReadTimeout = m_timeout;
+                }
+
+                {
+                    // Processes response from server. Request stream should already be there.
+
+                    // Cosmos: a new response on the connection, so a clone made before (GetRequestStream's) gives back
+                    // nothing over it when disposed (InputNetworkStreamWrapper.TakeReadState).
+                    m_requestStream.StartResponse();
+
+                    respData = ParseHTTPResponse(m_requestStream, m_keepAlive);
+                    ThrowIfMalformed(respData);
+
+                    // Cosmos: every interim response (1xx but 101) handed to the continue delegate, if any, and skipped,
+                    // where nanoFramework skipped one 100 Continue, and none with a delegate: a 103 Early Hints would
+                    // have been the response, and the real one read by the next request on the connection.
+                    while (respData.m_statusCode >= 100 && respData.m_statusCode < 200 && respData.m_statusCode != (int)HttpStatusCode.SwitchingProtocols)
+                    {
+                        if (m_continueDelegate != null)
+                        {
+                            m_continueDelegate(respData.m_statusCode, respData.m_headers);
+                        }
+
+                        respData = ParseHTTPResponse(m_requestStream, m_keepAlive);
+                        ThrowIfMalformed(respData);
+                    }
+                }
+
+                m_requestStream.ReadTimeout = readTimeout;
+
+                // Cosmos: a response that has no body whatever its headers say (RFC 9112, 6.3): reading one would wait
+                // for bytes that never come on a kept-alive connection.
+                // 101 excepted: the connection is the new protocol's (a WebSocket's) after it.
+                int status = respData.m_statusCode;
+                if (m_method == "HEAD" || status == (int)HttpStatusCode.NoContent || status == (int)HttpStatusCode.NotModified)
+                {
+                    m_requestStream.m_BytesLeftInResponse = 0;
+                    respData.m_chunked = false;
+                }
+
+                response = new HttpWebResponse(m_method, m_originalUrl, respData, this);
+
+                // Now we look if response has chunked encoding. If it is chunked, we need to set flag in m_requestStream we return.
+                m_requestStream.m_EnableChunkedDecoding = respData.m_chunked;
+
+                // Currently the request and response are the same network streams, but we optimize later.
+                response.SetResponseStream(m_requestStream);
+
+                m_responseStatus = response.StatusCode;
+
+                m_responseCreated = true;
+
+                // Cosmos: the connection stays in use until the response is disposed, which releases it once its body is
+                // read (InputNetworkStreamWrapper.ReleaseStream). nanoFramework lent it to the next request now, which
+                // would then read what is left of this response's body.
+            }
+            catch (Exception e)
+            {
+                // Without it, any failure between the connection being established and the response being fully
+                // constructed (bad status line, malformed headers, a throwing continue-delegate, etc.) leaks the
+                // connection/socket.
+                // Cosmos: the connection out of the pool too, as nanoFramework closed its socket only: Cosmos's Poll
+                // says a closed socket has nothing to read, so the pool would lend it to every later request.
+                if (m_requestStream != null)
+                {
+                    RemoveStreamFromPool(m_requestStream);
+
+                    try
+                    {
+                        m_requestStream.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (e is WebException)
+                {
+                    throw;
+                }
+
+                throw new WebException("GetResponse() failed", e);
+            }
+
+
+            return response;
+        }
+
+        /// <summary>
+        /// Submits a request with HTTP headers to the server, and returns a
+        /// <b>Stream</b> object to use to write request data.
+        /// </summary>
+        /// <returns>A <b>Stream</b> to use to write request data.</returns>
+        /// <remarks>Used for POST of PUT requests.</remarks>
+        public override Stream GetRequestStream()
+        {
+            // Validates the call to GetRequestStream. Throws exception on errors.
+            ValidateGetRequestStream();
+
+            // Submits the request.
+            try
+            {
+                SubmitRequest();
+            }
+            catch
+            {
+                if (m_requestStream != null)
+                {
+                    RemoveStreamFromPool(m_requestStream);
+                    m_requestStream.Dispose();
+                }
+                throw;
+            }
+
+            // Return the stream
+            return m_requestStream.CloneStream();
+        }
+
+        /// <summary>
+        /// Constucts WEB exception if error is detected during parsing.
+        /// </summary>
+        /// <param name="inner">Inner exception network exception</param>
+        /// <param name="resp">Partially constructed HttpWebResponse</param>
+        /// <returns>WebException instance</returns>
+        private static WebException protocolError(Exception inner,
+                                                   HttpWebResponse resp)
+        {
+            HttpStatusCode statusCode = resp.StatusCode;
+            int sr = (int)statusCode;
+            string message = "(" + ((int)statusCode) + ")";
+            string description;
+            description = resp.StatusDescription;
+            if (description != null && description.Length > 0)
+                message += " " + description;
+            message = "Server returned error" + message;
+            return new WebException(message, inner,
+                                     WebExceptionStatus.ProtocolError, resp);
+        }
+
+        internal bool m_sentHeaders = false;
+
+        private bool hasEntityData()
+        {
+            if (m_httpWriteMode != HttpWriteMode.None)
+                return true;
+            else
+                return false;
+        }
+
+        private bool canWrite()
+        {
+            return !KnownVerbs.GetHttpVerbType(Method).m_ContentBodyNotAllowed;
+        }
+
+        /// <summary>
+        /// Retrieves HTTP request as bytes array.  Used to create a request
+        /// message.
+        /// </summary>
+        /// <returns>Byte array with HTTP request. This data is sent through network.</returns>
+        private byte[] GetHTTPRequestData()
+        {
+            //step 1 - compute the length of the headers.
+
+            string statusLine;
+
+            // Connect verbs require CONNECT host:port
+            if (Method.ToUpper().Equals("CONNECT"))
+            {
+                statusLine = "CONNECT " + Address.Host + ":" + Address.Port + " HTTP/" + ProtocolVersion + "\r\n";
+            }
+            else if (m_proxy != null
+                     && m_originalUrl.Scheme != Uri.UriSchemeHttps
+                     && m_originalUrl.Scheme != Uri.UriSchemeWss)
+            {
+                statusLine = Method + " " + Address.AbsoluteUri + " HTTP/" + ProtocolVersion + "\r\n";
+            }
+            else
+            {
+                // statusLine = Method + " " + Address.AbsolutePath + " HTTP/" + ProtocolVersion + "\r\n";    // .PathAndQuery
+                statusLine = Method + " " + Address.PathAndQuery + " HTTP/" + ProtocolVersion + "\r\n";
+            }
+
+            //most intrinsic headers are stored in the webheaders class
+            //content length is not.
+            int headersLength = statusLine.Length;
+
+            //extra header lengths.  Includes extension headers.
+            headersLength += Headers.byteLength();
+
+            byte[] headerBytes = new byte[headersLength];
+
+            int currentOffset = 0;
+            //store the request line
+            currentOffset += copyString(statusLine, headerBytes,
+                                         currentOffset);
+
+            //now for the general headers
+            currentOffset += Headers.copyTo(headerBytes, currentOffset);
+
+            return headerBytes;
+        }
+
+        /// <summary>
+        /// Converts array to string by casting bytes to chars.
+        /// </summary>
+        /// <param name="data">Array with byte data.</param>
+        /// <param name="offset">Offset to start convertion.</param>
+        /// <param name="count">Count of bytes to convert to string.</param>
+        /// <returns>String converted from byte array.</returns>
+        private static string toEAscii(byte[] data, int offset, int count)
+        {
+            char[] output = new char[count];
+            for (int i = 0; i < count; ++i)
+            {
+                output[i] = (char)data[offset + i];
+            }
+
+            return new string(output, 0, count);
+        }
+
+        /// <summary>
+        /// Convert string to array of bytes
+        /// </summary>
+        /// <param name="data">string to convert</param>
+        /// <returns>array of bytes converted from string</returns>
+        internal static byte[] fromEAscii(string data)
+        {
+            byte[] ret = new byte[data.Length];
+            for (int i = 0; i < data.Length; ++i)
+            {
+                ret[i] = (byte)data[i];
+            }
+
+            return ret;
+        }
+
+        /// <summary>
+        /// This function returns true if the response code from the server
+        /// (i.e. 304) MUST NOT have any entity data.  I will artificially set
+        /// the content length in the stream to zero, so that reading...
+        /// </summary>
+        /// <param name="responseCode">HTTP response code</param>
+        /// <returns><b>true</b> if the specified response code is one of the
+        /// defined values; otherwise, <b>false</b>.</returns>
+        private bool setContentLengthToZero(HttpStatusCode responseCode)
+        {
+            switch (responseCode)
+            {
+                case HttpStatusCode.SwitchingProtocols:
+                case HttpStatusCode.ResetContent:
+                case HttpStatusCode.NotModified:
+                case HttpStatusCode.NoContent:
+                case HttpStatusCode.UseProxy:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// Copies a string into an array of bytes.
+        /// </summary>
+        /// <param name="src">A String to copy.</param>
+        /// <param name="bytes">Output array.</param>
+        /// <param name="offset">Offset to start placing data in array.</param>
+        /// <returns>Count of bytes copied</returns>
+        private static int copyString(String src, byte[] bytes, int offset)
+        {
+            int i;
+            for (i = 0; i < src.Length; ++i)
+                bytes[offset + i] = (byte)src[i];
+            return i;
+        }
+    }
+}

@@ -1,17 +1,31 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!--
+    .NET nanoFramework's HttpUnitTests (Tests/HttpUnitTests), run on the desktop with MSTest: the
+    nanoFramework.TestFramework they are written against is MSTest's shape, and TestFramework.cs maps it.
+  -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
-    <Nullable>enable</Nullable>
+    <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <IsPackable>false</IsPackable>
+    <!-- Properties/AssemblyInfo.cs (nanoFramework's) sets the assembly attributes. -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <!-- nanoFramework's tests document nothing. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
-    <PackageReference Include="NUnit" Version="4.6.1" />
-    <PackageReference Include="NUnit3TestAdapter" Version="6.2.0" />
+    <PackageReference Include="MSTest.TestAdapter" Version="3.9.3" />
+    <PackageReference Include="MSTest.TestFramework" Version="3.9.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- They test nanoFramework's own System.Uri, which the port leaves out for .NET's. -->
+    <Compile Remove="UriUnitTests.cs" />
+    <None Include="UriUnitTests.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,0 +1,95 @@
+﻿//
+// Copyright (c) .NET Foundation and Contributors
+// Portions Copyright (c) Microsoft Corporation.  All rights reserved.
+// See LICENSE file in the project root for full license information.
+//
+
+using Cosmos.Network.Http.Headers;
+
+namespace Cosmos.Network.Http.Headers
+{
+    /// <summary>
+    /// Represents the collection of Content Headers as defined in RFC 2616.
+    /// </summary>
+    public sealed class HttpContentHeaders : HttpHeaders
+    {
+        private readonly HttpContent _content;
+
+        /// <summary>
+        /// Gets or sets the value of the Content-Length content header on an HTTP response.
+        /// </summary>
+        /// <value>The value of the Content-Length content header on an HTTP response.</value>
+        /// <remarks>
+        /// In .NET nanoFramework this property is read-only.
+        /// </remarks>
+        public long ContentLength
+        {
+            get
+            {
+                if (_content.Headers is not null
+                    && _content.Headers._headerStore is not null)
+                {
+                    var contentLengthValue = _content.Headers._headerStore.GetValues(HttpKnownHeaderNames.ContentLength);
+
+                    if (contentLengthValue is not null
+                        && contentLengthValue.Length > 0)
+                    {
+                        return Convert.ToInt64(contentLengthValue[0]);
+                    }
+
+                    if(_content.TryComputeLength(out long computedOrBufferLength))
+                    {
+                        _content.Headers._headerStore.SetAddVerified(HttpKnownHeaderNames.ContentLength, computedOrBufferLength.ToString());
+                        return computedOrBufferLength;
+                    }
+                }
+
+                return -1;
+            }
+
+            set
+            {
+                throw new PlatformNotSupportedException();
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the value of the Content-Type content header on an HTTP response.
+        /// </summary>
+        /// <value>The value of the Content-Type content header on an HTTP response.</value>
+        public MediaTypeHeaderValue ContentType
+        {
+            get
+            {
+                // Cosmos: null without the header, or with one that isn't a media type, as .NET's; nanoFramework threw
+                // ArgumentNullException or FormatException.
+                string value = _headerStore[HttpKnownHeaderNames.ContentType];
+                if (value == null)
+                {
+                    return null;
+                }
+
+                try
+                {
+                    return MediaTypeHeaderValue.Parse(value);
+                }
+                catch (FormatException)
+                {
+                    return null;
+                }
+            }
+
+            set
+            {
+                // build header value, OK to add ; even if CharSet is empty
+                _headerStore.Add(HttpKnownHeaderNames.ContentType, value.ToString());
+            }
+        }
+
+        internal HttpContentHeaders(HttpContent parent)
+          : base(HttpHeaderType.Content | HttpHeaderType.Custom, HttpHeaderType.None)
+        {
+            _content = parent;
+        }
+    }
+}
