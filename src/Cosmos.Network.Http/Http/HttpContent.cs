@@ -5,10 +5,10 @@
 //
 
 using System.IO;
-using System.Net.Http.Headers;
+using Cosmos.Network.Http.Headers;
 using System.Text;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// A base class representing an HTTP entity body and content headers.
@@ -93,7 +93,7 @@ namespace System.Net.Http
         {
             if (_disposed)
             {
-                throw new ObjectDisposedException();
+                throw new ObjectDisposedException(nameof(HttpContent));
             }
 
             if (_buffer != null)

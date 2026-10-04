@@ -6,7 +6,7 @@
 
 using System.Diagnostics;
 
-namespace System.Net.Http.Headers
+namespace Cosmos.Network.Http.Headers
 {
     // The purpose of this type is to extract the handling of general headers in one place rather than duplicating
     // functionality in both HttpRequestHeaders and HttpResponseHeaders.

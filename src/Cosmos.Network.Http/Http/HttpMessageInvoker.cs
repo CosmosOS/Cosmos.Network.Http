@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// A specialty class that allows applications to call the <see cref="Send"/>(HttpRequestMessage) method on an HTTP handler chain.
@@ -86,7 +86,7 @@ namespace System.Net.Http
         {
             if (_disposed)
             {
-                throw new ObjectDisposedException();
+                throw new ObjectDisposedException(nameof(HttpMessageInvoker));
             }
         }
     }

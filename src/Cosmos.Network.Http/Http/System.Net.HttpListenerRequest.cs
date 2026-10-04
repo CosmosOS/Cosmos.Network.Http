@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System;
     using System.IO;
@@ -100,6 +100,18 @@ namespace System.Net
         {
             m_clientStream = clientStream;
 
+            // Cosmos: the endpoints while the connection is open: Cosmos's socket forgets them once closed (when the
+            // response is), where nanoFramework's throws ObjectDisposedException.
+            try
+            {
+                m_localEndPoint = clientStream.m_Socket.LocalEndPoint as IPEndPoint;
+                m_remoteEndPoint = clientStream.m_Socket.RemoteEndPoint as IPEndPoint;
+            }
+            catch
+            {
+                // Closed already.
+            }
+
             // maxHeaderLen is in kilobytes (Desktop designer decided so). If -1 just maximum integer value
             m_maxResponseHeadersLen = maxHeaderLen == -1 ? 0x7FFFFFFF : maxHeaderLen * 1024;
             // If not set, default for content length is -1
@@ -166,6 +178,10 @@ namespace System.Net
                 throw new ProtocolViolationException("Unsupported HTTP version: " + requestStr[2]);
             }
 
+            // Cosmos: an HTTP/1.1 connection persists unless the client says close (RFC 9112, 9.3), where nanoFramework
+            // kept only one whose client says keep-alive, which HTTP/1.1 clients don't.
+            m_KeepAlive = m_requestHttpVer == HttpVersion.Version11;
+
             // Now it is list of HTTP headers:
             string line;
             int headersLen = m_maxResponseHeadersLen;
@@ -199,7 +215,15 @@ namespace System.Net
                 {
                     // If value is "Keep-Alive" ( lower case now ), set m_KeepAlive to true;
                     headerValue = headerValue.ToLower();
-                    m_KeepAlive = headerValue == "keep-alive";
+                    // Cosmos: close or keep-alive among the header's options, else the version's default.
+                    if (headerValue.IndexOf("close") >= 0)
+                    {
+                        m_KeepAlive = false;
+                    }
+                    else if (headerValue.IndexOf("keep-alive") >= 0)
+                    {
+                        m_KeepAlive = true;
+                    }
                 }
 
                 // If user supplied user name and password - parse it and store in m_NetworkCredentials
@@ -364,8 +388,12 @@ namespace System.Net
         /// </value>
         public IPEndPoint LocalEndPoint
         {
-            get { return (IPEndPoint)m_clientStream.m_Socket.LocalEndPoint; }
+            get { return m_localEndPoint; }
         }
+
+        // Cosmos: see the constructor.
+        private readonly IPEndPoint m_localEndPoint;
+        private readonly IPEndPoint m_remoteEndPoint;
 
         /// <summary>
         /// Gets the HTTP version used by the requesting client.
@@ -389,7 +417,7 @@ namespace System.Net
         /// address and port number from which the request originated.</value>
         public IPEndPoint RemoteEndPoint
         {
-            get { return (IPEndPoint)m_clientStream.m_Socket.RemoteEndPoint; }
+            get { return m_remoteEndPoint; }
         }
 
         /// <summary>
@@ -418,7 +446,8 @@ namespace System.Net
         /// information.</value>
         public string UserHostAddress
         {
-            get { return ((IPEndPoint)m_clientStream.m_Socket.LocalEndPoint).Address.ToString(); }
+            // Cosmos: null when unknown, where nanoFramework dereferences it (a kernel panic on Cosmos).
+            get { return m_localEndPoint?.Address?.ToString(); }
         }
 
         /// <summary>
@@ -428,7 +457,8 @@ namespace System.Net
         /// <value>A String value that contains the text of the request's Host header.</value>
         public string UserHostName
         {
-            get { return m_httpRequestHeaders[HttpKnownHeaderNames.UserAgent]; }
+            // Cosmos: the Host header, as documented, where nanoFramework returns the User-Agent one.
+            get { return m_httpRequestHeaders[HttpKnownHeaderNames.Host]; }
         }
 
         /// <summary>

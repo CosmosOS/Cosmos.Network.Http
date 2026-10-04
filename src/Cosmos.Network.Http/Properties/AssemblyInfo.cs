@@ -9,12 +9,7 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyProduct("Cosmos.Network.Http")]
 [assembly: AssemblyCopyright("Copyright (c) .NET Foundation and Contributors")]
 
-//////////////////////////////////////////////////////
-// this assembly does NOT have a native counterpart //
-//////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////
-[assembly: AssemblyNativeVersion("0.0.0.0")]
-////////////////////////////////////////////////////////////////
+// Cosmos: nanoFramework's AssemblyNativeVersion (the version of the native counterpart) has no .NET equivalent.
 
 // Setting ComVisible to false makes the types in this assembly not visible 
 // to COM components.  If you need to access a type in this assembly from 

@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     // Any int can be cast to a HttpStatusCode to allow checking for non http1.1
     // codes.

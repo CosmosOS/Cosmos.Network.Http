@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System.Diagnostics;
     using System.IO;
@@ -21,8 +21,8 @@ namespace System.Net
     /// </summary>
     internal class InputNetworkStreamWrapper : Stream, IKnowWhenDone
     {
-        static private Text.Decoder UTF8decoder = System.Text.Encoding.UTF8.GetDecoder();
-        static private Text.Encoding UTF8Encoding = System.Text.Encoding.UTF8;
+        static private System.Text.Decoder UTF8decoder = System.Text.Encoding.UTF8.GetDecoder();
+        static private System.Text.Encoding UTF8Encoding = System.Text.Encoding.UTF8;
 
         /// <summary>
         /// Actual network or SSL stream connected to the server.
@@ -99,6 +99,16 @@ namespace System.Net
         private bool m_isClone;
 
         /// <summary>
+        /// Cosmos: the stream this one is a clone of, which gets back what the clone read when it is disposed.
+        /// </summary>
+        private InputNetworkStreamWrapper m_original;
+
+        /// <summary>
+        /// Cosmos: counts the responses the connection carried, so a clone of an earlier one gives nothing back.
+        /// </summary>
+        private int m_generation;
+
+        /// <summary>
         /// Http web responses can contain the Content-Length of the response.  In these cases, we would like the stream to return an EOF indication
         /// if the caller tries to read past the content length. 
         /// </summary>
@@ -107,7 +117,10 @@ namespace System.Net
         /// <summary>
         /// Refills internal buffer from network.
         /// </summary>
-        [MethodImpl(MethodImplOptions.Synchronized)]
+        /// <remarks>
+        /// Cosmos: not synchronized, as nanoFramework's is: a Cosmos kernel doesn't release the lock while an exception
+        /// unwinds, and a read that times out throws. One thread reads a response at a time.
+        /// </remarks>
         private int RefillInternalBuffer()
         {
 #if DEBUG
@@ -144,6 +157,10 @@ namespace System.Net
             m_dataStart = m_dataEnd = 0;
             m_EnableChunkedDecoding = false;
             m_chunk = null;
+
+            // Cosmos: the end of the previous response, which a clone gives back (see TakeReadState).
+            IsDone = false;
+            m_generation++;
         }
 
         /// <summary>
@@ -163,6 +180,8 @@ namespace System.Net
             m_OwnsSocket = ownsSocket;
             m_rmAddrAndPort = rmAddrAndPort;
             m_InUse = true;
+            // Cosmos: when it was lent, as CheckPersistentConnections reads it.
+            m_lastUsed = DateTime.UtcNow;
             // negative value indicates no length is set, in which case we will continue to read upon the callers request
             m_BytesLeftInResponse = -1;
 
@@ -234,39 +253,53 @@ namespace System.Net
         {
             byte[] buffer = new byte[1024];
 
-            int waitTimeUs = m_BytesLeftInResponse == 0 ? 500000 : 1000000;
+            // Cosmos: drops what can be read without waiting. nanoFramework waits up to a second in Socket.Poll for
+            // more, which Cosmos's Poll doesn't do, and reads the socket's Available, which counts encrypted bytes for
+            // https and would leave Read waiting for a record that never comes; the stream's Length counts what it
+            // can return.
+            // What was read ahead belongs to the response.
+            if (m_BytesLeftInResponse > 0) m_BytesLeftInResponse -= Math.Min(m_dataEnd - m_dataStart, m_BytesLeftInResponse);
 
             try
             {
-                while (m_Socket.Poll(waitTimeUs, SelectMode.SelectRead))
+                int avail = (int)m_Stream.Length;
+
+                while (avail > 0)
                 {
-                    int avail = m_Socket.Available;
+                    int bytes = m_Stream.Read(buffer, 0, avail > buffer.Length ? buffer.Length : avail);
 
-                    if (avail == 0) break;
+                    if (bytes <= 0) break;
 
-                    while (avail > 0)
-                    {
-                        int bytes = m_Stream.Read(buffer, 0, avail > buffer.Length ? buffer.Length : avail);
+                    if (m_BytesLeftInResponse > 0) m_BytesLeftInResponse -= bytes;
 
-                        if (bytes <= 0) break;
-
-                        avail -= bytes;
-
-                        if (m_BytesLeftInResponse > 0) m_BytesLeftInResponse -= bytes;
-                    }
+                    avail = (int)m_Stream.Length;
                 }
             }
             catch
             {
             }
 
+            // Cosmos: whether the whole response was read, which nanoFramework's wait for the rest of it makes likely.
+            m_ResponseComplete = m_BytesLeftInResponse == 0 || (m_EnableChunkedDecoding && IsDone);
+
             m_dataEnd = m_dataStart = 0;
             m_BytesLeftInResponse = -1;
         }
 
+        // Cosmos: set by FlushReadBuffer.
+        private bool m_ResponseComplete;
+
         private void ReleaseThread()
         {
             FlushReadBuffer();
+
+            // Cosmos: a connection with part of a response still to come can't carry the next request.
+            if (!m_ResponseComplete)
+            {
+                HttpWebRequest.RemoveStreamFromPool(this);
+                Dispose();
+                return;
+            }
 
             m_lastUsed = DateTime.UtcNow;
             ResetState();
@@ -280,8 +313,9 @@ namespace System.Net
         ///
         public void ReleaseStream()
         {
-            Thread th = new Thread(new ThreadStart(ReleaseThread));
-            th.Start();
+            // Cosmos: on the calling thread, which FlushReadBuffer no longer holds; nanoFramework starts a thread for
+            // each response, and a Cosmos kernel never frees a thread's stack.
+            ReleaseThread();
         }
 
         /// <summary>
@@ -294,6 +328,19 @@ namespace System.Net
         {
             // Need to init return value to zero explicitly, otherwise warning generated.
             int retVal = 0;
+
+            // Cosmos: the end of a body of known length, or of a response without one (HEAD, 1xx, 204, 304), where
+            // nanoFramework would go on to return what follows it: the next response on a kept-alive connection.
+            if (m_BytesLeftInResponse == 0)
+            {
+                IsDone = true;
+                return 0;
+            }
+
+            if (m_BytesLeftInResponse > 0 && size > m_BytesLeftInResponse)
+            {
+                size = (int)m_BytesLeftInResponse;
+            }
 
             // As first step we copy the buffered data if present
             int dataBuffered = m_dataEnd - m_dataStart;
@@ -325,9 +372,16 @@ namespace System.Net
                 {
                     if (0 == RefillInternalBuffer())
                     {
+                        // Cosmos: what was copied from the buffer above is returned, where nanoFramework returned 0;
+                        // and a body cut short is an error, where it was the end.
+                        if (retVal == 0)
+                        {
+                            ThrowIfCutShort();
+                        }
+
                         // Handle the 'HTTP/1.0' case
                         IsDone = IsHttp1_0Completed();
-                        return 0;
+                        return retVal;
                     }
 
                     dataBuffered = m_dataEnd - m_dataStart;
@@ -347,6 +401,13 @@ namespace System.Net
                 else // Do not replentish internal buffer. Read rest of data directly
                 {
                     int bytesRead = m_Stream.Read(buffer, offset, size);
+
+                    // Cosmos: see above.
+                    if (bytesRead == 0 && retVal == 0)
+                    {
+                        ThrowIfCutShort();
+                    }
+
                     retVal += bytesRead;
 
                     // Handle the 'HTTP/1.0' case                    
@@ -365,9 +426,30 @@ namespace System.Net
 
                 // in case there were more bytes in the buffer than we expected make sure the next call returns 0
                 if (m_BytesLeftInResponse < 0) m_BytesLeftInResponse = 0;
+
+                // Cosmos: the end of the body.
+                if (m_BytesLeftInResponse == 0) IsDone = true;
             }
 
             return retVal;
+        }
+
+        /// <summary>
+        /// Cosmos: throws when the connection ended before the body did: the rest of a length it gave, or of a chunk.
+        /// nanoFramework's StreamContent slept and read again, forever, and a Cosmos one would return the body cut
+        /// short as if complete.
+        /// </summary>
+        private void ThrowIfCutShort()
+        {
+            if (m_BytesLeftInResponse > 0)
+            {
+                throw new IOException("The connection was closed " + m_BytesLeftInResponse + " bytes before the end of the body.");
+            }
+
+            if (m_EnableChunkedDecoding)
+            {
+                throw new IOException("The connection was closed before the last chunk of the body.");
+            }
         }
 
         /// <summary>
@@ -490,8 +572,55 @@ namespace System.Net
         {
             InputNetworkStreamWrapper clone = this.MemberwiseClone() as InputNetworkStreamWrapper;
             clone.m_isClone = true;
+            clone.m_original = this;
 
             return clone;
+        }
+
+        /// <summary>
+        /// Cosmos: the next request on a kept-alive connection: its own framing, after what was read ahead of it.
+        /// </summary>
+        internal void StartRequest()
+        {
+            m_EnableChunkedDecoding = false;
+            m_chunk = null;
+            IsDone = false;
+            m_BytesLeftInResponse = -1;
+            m_generation++;
+        }
+
+        /// <summary>
+        /// Cosmos: whether the whole body of the message was read: its length, or its last chunk.
+        /// </summary>
+        internal bool IsBodyRead => m_BytesLeftInResponse == 0 || (m_EnableChunkedDecoding && IsDone);
+
+        /// <summary>
+        /// Cosmos: a response begins on the connection: what a clone made before gives back is no longer its state.
+        /// </summary>
+        internal void StartResponse()
+        {
+            m_generation++;
+        }
+
+        /// <summary>
+        /// Cosmos: takes what a clone of this stream read of the response, so ReleaseStream knows whether all of it
+        /// was read and the connection can carry another request. nanoFramework reads whatever comes for a second
+        /// after a response and reuses the connection anyway.
+        /// </summary>
+        private void TakeReadState(InputNetworkStreamWrapper clone)
+        {
+            // Disposed after its response was released: the connection carries another now.
+            if (clone.m_generation != m_generation)
+            {
+                return;
+            }
+
+            m_readBuffer = clone.m_readBuffer;
+            m_dataStart = clone.m_dataStart;
+            m_dataEnd = clone.m_dataEnd;
+            m_BytesLeftInResponse = clone.m_BytesLeftInResponse;
+            m_chunk = clone.m_chunk;
+            IsDone = clone.IsDone;
         }
 
         /// <summary>
@@ -503,7 +632,16 @@ namespace System.Net
 
             // Clones share m_Stream/m_Socket with the original (see CloneStream), so only
             // the original may close them. HttpResponseMessage disposes the original deterministically.
-            if (!m_isClone)
+            if (m_isClone)
+            {
+                // Cosmos: see TakeReadState.
+                if (m_original != null)
+                {
+                    m_original.TakeReadState(this);
+                    m_original = null;
+                }
+            }
+            else
             {
                 m_Stream.Close();
 
@@ -604,7 +742,7 @@ namespace System.Net
             }
             else if (curPos == 0)
             {
-                throw new SocketException(SocketError.ConnectionAborted);
+                throw new SocketException((int)SocketError.ConnectionAborted);
             }
 
             return "";
@@ -619,7 +757,7 @@ namespace System.Net
             // Refills internal buffer if there is no more data
             if (m_dataEnd == m_dataStart)
             {
-                if (0 == RefillInternalBuffer()) throw new SocketException(SocketError.ConnectionAborted);
+                if (0 == RefillInternalBuffer()) throw new SocketException((int)SocketError.ConnectionAborted);
             }
             return m_readBuffer[m_dataStart];
         }
@@ -633,7 +771,7 @@ namespace System.Net
             // Refills internal buffer if there is no more data
             if (m_dataEnd == m_dataStart)
             {
-                if (0 == RefillInternalBuffer()) throw new SocketException(SocketError.ConnectionAborted);
+                if (0 == RefillInternalBuffer()) throw new SocketException((int)SocketError.ConnectionAborted);
             }
             // Very similar to Peek, but moves current position to next byte.
             return m_readBuffer[m_dataStart++];
@@ -783,9 +921,10 @@ namespace System.Net
             return nextChunk;
         }
 
-        public override int Read(SpanByte buffer)
+        public override int Read(Span<byte> buffer)
         {
-            throw new NotSupportedException();
+            // Cosmos: nanoFramework's SpanByte overload threw; .NET's reads through Read(byte[], int, int), as Stream's does.
+            return base.Read(buffer);
         }
 
         private enum ChunkState

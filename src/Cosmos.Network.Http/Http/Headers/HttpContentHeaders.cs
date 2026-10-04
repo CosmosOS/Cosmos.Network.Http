@@ -4,9 +4,9 @@
 // See LICENSE file in the project root for full license information.
 //
 
-using System.Net.Http.Http.Headers;
+using Cosmos.Network.Http.Headers;
 
-namespace System.Net.Http.Headers
+namespace Cosmos.Network.Http.Headers
 {
     /// <summary>
     /// Represents the collection of Content Headers as defined in RFC 2616.
@@ -61,7 +61,22 @@ namespace System.Net.Http.Headers
         {
             get
             {
-                return MediaTypeHeaderValue.Parse(_headerStore[HttpKnownHeaderNames.ContentType]);
+                // Cosmos: null without the header, or with one that isn't a media type, as .NET's; nanoFramework threw
+                // ArgumentNullException or FormatException.
+                string value = _headerStore[HttpKnownHeaderNames.ContentType];
+                if (value == null)
+                {
+                    return null;
+                }
+
+                try
+                {
+                    return MediaTypeHeaderValue.Parse(value);
+                }
+                catch (FormatException)
+                {
+                    return null;
+                }
             }
 
             set

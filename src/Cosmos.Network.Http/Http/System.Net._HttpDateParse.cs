@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Internal class that parses the string with date in HTTP headers to DateTime object.

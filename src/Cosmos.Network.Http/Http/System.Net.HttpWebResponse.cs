@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System;
     using System.IO;
@@ -297,7 +297,11 @@ namespace System.Net
                     if (m_httpResponseHeaders != null) connValue = m_httpResponseHeaders[HttpKnownHeaderNames.Connection];
 
                     // If server had not send this header or value is not "close", then we keep connection.
-                    closeConnection = connValue == null || connValue.ToLower() == HttpKnownHeaderValues.close;
+                    // Cosmos: as this says, where nanoFramework closed a connection without the header too. An HTTP/1.0
+                    // server keeps it only when it says so.
+                    closeConnection = connValue != null
+                        ? connValue.ToLower().IndexOf(HttpKnownHeaderValues.close) >= 0
+                        : m_version == null || m_version.Major < 1 || (m_version.Major == 1 && m_version.Minor < 1);
                 }
 
                 // If it is not in the list - Add it
@@ -330,14 +334,10 @@ namespace System.Net
         /// </remarks>
         public override void Close()
         {
-            if (m_responseStream != null)
-            {
-                // Closing connection socket
-                m_responseStream.Dispose();
-
-                // Set flag that we already completed work on this stream.
-                m_responseStream = null;
-            }
+            // Cosmos: releases the connection for reuse, as said above, through Dispose. nanoFramework closed its socket
+            // and left it in the pool of persistent connections, and WebResponse.Dispose calls Close.
+            Dispose(true);
+            GC.SuppressFinalize(this);
         }
     }
 }

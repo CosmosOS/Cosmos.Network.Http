@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System.IO;
     using System.Net.Sockets;
@@ -33,6 +33,32 @@ namespace System.Net
         /// If true causes all written data to be encoded as chunks
         /// </summary>
         internal bool m_enableChunkedEncoding = false;
+
+        /// <summary>
+        /// Cosmos: whether the last chunk was sent, so it is sent once: by Flush, else by HttpListenerResponse.Close.
+        /// </summary>
+        private bool m_chunksFinished = false;
+
+        /// <summary>
+        /// Cosmos: the connection's reader, kept across its requests: what it read ahead of one request is the next's.
+        /// nanoFramework made one per request, which dropped it.
+        /// </summary>
+        internal InputNetworkStreamWrapper m_Input;
+
+        /// <summary>
+        /// Cosmos: the body bytes the response wrote, so its Close knows whether it sent what its Content-Length said.
+        /// </summary>
+        internal long m_BodyWritten;
+
+        /// <summary>
+        /// Cosmos: whether the last chunk of a chunked response was sent.
+        /// </summary>
+        internal bool ChunksFinished => m_chunksFinished;
+
+        /// <summary>
+        /// Cosmos: whether bytes of a request wait in the connection's reader, already read from the socket.
+        /// </summary>
+        internal bool HasBufferedInput => m_Input != null && m_Input.m_dataEnd > m_Input.m_dataStart;
 
         /// <summary>
         /// Type definition of delegate for sending of HTTP headers.
@@ -68,6 +94,25 @@ namespace System.Net
         internal SendHeadersDelegate HeadersDelegate { set { m_headersSend = value; } }
 
         /// <summary>
+        /// Cosmos: the stream to write to, which is gone once this one is closed (by the handler, or by an Abort on
+        /// another thread): an ObjectDisposedException then, where nanoFramework dereferences null, a kernel panic on
+        /// Cosmos.
+        /// </summary>
+        private NetworkStream Target
+        {
+            get
+            {
+                NetworkStream stream = m_Stream;
+                if (stream == null)
+                {
+                    throw new ObjectDisposedException(nameof(OutputNetworkStreamWrapper));
+                }
+
+                return stream;
+            }
+        }
+
+        /// <summary>
         /// Return true if stream support reading.
         /// </summary>
         public override bool CanRead { get { return false; } }
@@ -80,7 +125,7 @@ namespace System.Net
         /// <summary>
         /// Return true if timeout is applicable to the stream
         /// </summary>
-        public override bool CanTimeout { get { return m_Stream.CanTimeout; } }
+        public override bool CanTimeout { get { return Target.CanTimeout; } }
 
         /// <summary>
         /// Return true if stream support writing. It should be true, as this is output stream.
@@ -115,8 +160,8 @@ namespace System.Net
         /// </summary>
         public override int ReadTimeout
         {
-            get { return m_Stream.ReadTimeout; }
-            set { m_Stream.ReadTimeout = value; }
+            get { return Target.ReadTimeout; }
+            set { Target.ReadTimeout = value; }
         }
 
         /// <summary>
@@ -124,8 +169,8 @@ namespace System.Net
         /// </summary>
         public override int WriteTimeout
         {
-            get { return m_Stream.WriteTimeout; }
-            set { m_Stream.WriteTimeout = value; }
+            get { return Target.WriteTimeout; }
+            set { Target.WriteTimeout = value; }
         }
 
         /// <summary>
@@ -134,8 +179,8 @@ namespace System.Net
         private void WriteChunkStart(int size)
         {
             byte[] chunkLengthBytes = Encoding.UTF8.GetBytes($"{size:X}");
-            m_Stream.Write(chunkLengthBytes, 0, chunkLengthBytes.Length);
-            m_Stream.Write(EOLMarker, 0, EOLMarker.Length);
+            Target.Write(chunkLengthBytes, 0, chunkLengthBytes.Length);
+            Target.Write(EOLMarker, 0, EOLMarker.Length);
         }
 
         /// <summary>
@@ -143,7 +188,32 @@ namespace System.Net
         /// </summary>
         private void WriteChunkEnd()
         {
-            m_Stream.Write(EOLMarker, 0, EOLMarker.Length);
+            Target.Write(EOLMarker, 0, EOLMarker.Length);
+        }
+
+        /// <summary>
+        /// Cosmos: starts a response on the connection, which may be kept alive after another: not chunked yet.
+        /// </summary>
+        internal void StartResponse(SendHeadersDelegate headersSend)
+        {
+            m_headersSend = headersSend;
+            m_enableChunkedEncoding = false;
+            m_chunksFinished = false;
+            m_BodyWritten = 0;
+        }
+
+        /// <summary>
+        /// Cosmos: sends the last chunk of a chunked response whose headers were sent, unless it was. nanoFramework's
+        /// HttpListenerResponse.Close flushes the network stream, not this one, so a chunked response never ended
+        /// unless its OutputStream was flushed.
+        /// </summary>
+        internal void FinishChunks()
+        {
+            if (m_enableChunkedEncoding && !m_chunksFinished && m_headersSend == null && m_Stream != null)
+            {
+                m_chunksFinished = true;
+                WriteChunkFinish();
+            }
         }
 
         /// <summary>
@@ -152,9 +222,9 @@ namespace System.Net
         private void WriteChunkFinish()
         {
             byte[] zero = { 0x30 };
-            m_Stream.Write(zero, 0, 1);
-            m_Stream.Write(EOLMarker, 0, EOLMarker.Length);
-            m_Stream.Write(EOLMarker, 0, EOLMarker.Length);
+            Target.Write(zero, 0, 1);
+            Target.Write(EOLMarker, 0, EOLMarker.Length);
+            Target.Write(EOLMarker, 0, EOLMarker.Length);
         }
 
         /// <summary>
@@ -165,7 +235,15 @@ namespace System.Net
             if (m_headersSend != null)
             {
                 // Calls HttpListenerResponse.SendHeaders. HttpListenerResponse.SendHeaders sets m_headersSend to null.
-                m_headersSend();
+                // Cosmos: the connection closed even when the client is gone, which nanoFramework left open.
+                try
+                {
+                    m_headersSend();
+                }
+                catch
+                {
+                    m_headersSend = null;
+                }
             }
 
             if (m_Stream != null) m_Stream.Close();
@@ -184,10 +262,7 @@ namespace System.Net
                 m_headersSend();
             }
 
-            if (m_enableChunkedEncoding)
-            {
-                WriteChunkFinish();
-            }
+            FinishChunks();
 
             // Need to check for null before using here
             m_Stream?.Flush();
@@ -249,7 +324,8 @@ namespace System.Net
                 WriteChunkStart(1);
             }
 
-            m_Stream.WriteByte(value);
+            m_BodyWritten++;
+            Target.WriteByte(value);
 
             if (m_enableChunkedEncoding)
             {
@@ -268,6 +344,12 @@ namespace System.Net
         /// <param name="size">Count of bytes to write.</param>
         public override void Write(byte[] buffer, int offset, int size)
         {
+            // Cosmos: a chunk of 0 bytes is the last one.
+            if (size == 0 && m_enableChunkedEncoding)
+            {
+                return;
+            }
+
             if (m_headersSend != null)
             {
                 // Calls HttpListenerResponse.SendHeaders. HttpListenerResponse.SendHeaders sets m_headersSend to null.
@@ -279,7 +361,8 @@ namespace System.Net
                 WriteChunkStart(size);
             }
 
-            m_Stream.Write(buffer, offset, size);
+            m_BodyWritten += size;
+            Target.Write(buffer, offset, size);
 
             if (m_enableChunkedEncoding)
             {
@@ -287,7 +370,7 @@ namespace System.Net
             }
         }
 
-        public override int Read(SpanByte buffer)
+        public override int Read(Span<byte> buffer)
         {
             throw new NotSupportedException();
         }

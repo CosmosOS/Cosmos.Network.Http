@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System.Collections;
     using System.Text;
@@ -716,7 +716,9 @@ namespace System.Net
                 }
 
                 string[] stringArray = new string[tempCollection.Count];
-                return (string[])tempCollection.ToArray(typeof(string));
+                // Cosmos: ArrayList.ToArray(Type) makes the array by reflection, which NativeAOT may not have compiled.
+                tempCollection.CopyTo(stringArray);
+                return stringArray;
             }
         }
 

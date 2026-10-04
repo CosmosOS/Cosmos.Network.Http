@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Indicates if <see cref="HttpClient"/> operations should be considered completed either as soon as a response is available, or after reading the entire response message including the content.

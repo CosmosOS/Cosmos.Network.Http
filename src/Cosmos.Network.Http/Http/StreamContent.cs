@@ -7,7 +7,7 @@
 using System.IO;
 using System.Threading;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Provides HTTP content based on a stream.
@@ -97,8 +97,11 @@ namespace System.Net.Http
 
                     if (read == 0 && !isDone)
                     {
-                        // need to let the native layer get more data
-                        Thread.Sleep(10);
+                        // Cosmos: no more. The Cosmos NetworkStream's Read waits for data itself and returns 0 only once
+                        // the connection is closed, which nanoFramework's sleep here would then wait on forever (on a
+                        // Cosmos kernel's main thread, which must never sleep). A body cut short throws in Read
+                        // (InputNetworkStreamWrapper.ThrowIfCutShort).
+                        break;
                     }
                     else if (read > 0)
                     {

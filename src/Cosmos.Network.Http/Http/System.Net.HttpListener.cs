@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System.Collections;
     using System.Diagnostics;
@@ -59,7 +59,29 @@ namespace System.Net
         /// <summary>
         /// Event that indicates arrival of new event from client.
         /// </summary>
-        private AutoResetEvent m_RequestArrived;
+        // Cosmos: the connections waiting for a request, which GetContext watches where nanoFramework starts a thread
+        // for each (WaitingConnection).
+        private ArrayList m_WaitingConnections;
+
+        // Cosmos: the listener the current thread serves (calls GetContext for, and handles the requests of), and
+        // whether one does: the sockets are that thread's alone, as Cosmos's network stack takes no lock. Stop, Close
+        // and Abort on another thread only ask; the serving thread closes them on its way into or out of GetContext,
+        // when a response hands a connection back, or in its own Stop or Close.
+        [ThreadStatic]
+        private static HttpListener t_served;
+        private volatile bool m_HasServingThread;
+
+        private bool OnServingThread => !m_HasServingThread || t_served == this;
+
+        // Cosmos: the https connections whose TLS handshake is under way (Handshaking), which GetContext advances.
+        private ArrayList m_Handshaking;
+
+        // Cosmos: whether Abort, called while a thread waited in GetContext, left that thread to close the connections.
+        internal volatile bool m_AbortPending;
+
+        // Cosmos: whether the listening socket was closed (1), claimed with Interlocked so that one thread closes it:
+        // Stop's, or the one in GetContext.
+        private int m_ListenerClosed = 1;
 
         /// <summary>
         /// The queue of connected networks streams with pending client data.
@@ -80,7 +102,7 @@ namespace System.Net
         /// Indicates whether the listener is started and is currently accepting
         /// connections.
         /// </summary>
-        private bool m_ServiceRunning;
+        private volatile bool m_ServiceRunning;
 
         /// <summary>
         /// Indicates whether the listener has been closed
@@ -91,11 +113,6 @@ namespace System.Net
         /// Array of connected client sockets.
         /// </summary>
         private ArrayList m_ClientStreams;
-
-        /// <summary>
-        /// Http Thread for accepting new connections.
-        /// </summary>
-        private Thread m_thAccept;
 
         /// <summary>
         /// SslProtocol which shall be used.
@@ -162,23 +179,21 @@ namespace System.Net
         /// </param>
         private void InitListener(string prefix, int port, IPAddress localEndpointIp = null)
         {
-            switch (prefix.ToLower())
+            // Cosmos: .NET's Uri schemes are not constants, and its Uri has no default port fields.
+            string scheme = prefix.ToLower();
+            if (scheme == Uri.UriSchemeHttp || scheme == Uri.UriSchemeWs)
             {
-                case Uri.UriSchemeHttp:
-                case Uri.UriSchemeWs:
-                    {
-                        m_IsHttpsConnection = false;
-                        m_Port = Uri.HttpDefaultPort;
-                        break;
-                    }
-                case Uri.UriSchemeHttps:
-                case Uri.UriSchemeWss:
-                    {
-                        m_IsHttpsConnection = true;
-                        m_Port = Uri.HttpsDefaultPort;
-                        break;
-                    }
-                default: throw new ArgumentException("Prefix should be http or https");
+                m_IsHttpsConnection = false;
+                m_Port = 80;
+            }
+            else if (scheme == Uri.UriSchemeHttps || scheme == Uri.UriSchemeWss)
+            {
+                m_IsHttpsConnection = true;
+                m_Port = 443;
+            }
+            else
+            {
+                throw new ArgumentException("Prefix should be http or https");
             }
 
             if (port != -1)
@@ -192,7 +207,8 @@ namespace System.Net
             }
             // Default members initialization
             m_maxResponseHeadersLen = 4;
-            m_RequestArrived = new AutoResetEvent(false);
+            m_WaitingConnections = new ArrayList();
+            m_Handshaking = new ArrayList();
             m_InputStreamsQueue = new Queue();
             m_ClientStreams = new ArrayList();
         }
@@ -231,77 +247,181 @@ namespace System.Net
             }
         }
 
+        // Cosmos: nanoFramework accepts on a thread of its own, waits for a kept-alive connection's next request on a
+        // thread per connection blocked in Socket.Poll, and wakes GetContext with an AutoResetEvent. On a Cosmos kernel
+        // Socket.Poll doesn't wait, a thread's stack is never freed, the network stack has no locks, and two threads
+        // throwing at once halt the kernel (a failed TLS handshake throws). So the thread in GetContext does it all: it
+        // accepts, runs the TLS handshakes and watches the connections waiting for a request, and no other thread
+        // touches the sockets.
+
+        // How long GetContext sleeps between two rounds with nothing to do: each Thread.Sleep writes a line to a Cosmos
+        // kernel's serial port (its LowLevelMonitor plug logs), which shorter sleeps would keep busy.
+        private const int IdleSleepMilliseconds = 50;
+
+        // How long a client may take to send what a request still lacks: one thread serves every connection.
+        private const int ClientReadTimeout = 10000;
+
         /// <summary>
-        /// Packages together an HttpListener and a socket.
+        /// A connection waiting for its next request, and since when.
         /// </summary>
-        /// <remarks>This class is used to package together an HttpListener and a socket.
-        /// We need to start new thread and pass 2 parameters - instance of listener and socket.
-        /// For that purpose we create class that keeps references to both listerner and socket and
-        /// start thread using member function of this class as delegate.
-        /// Internal class not visible to user.</remarks>
-        private class HttpListernerAndStream
+        private class WaitingConnection
         {
-            internal HttpListernerAndStream(HttpListener listener, OutputNetworkStreamWrapper outputStream)
+            internal WaitingConnection(OutputNetworkStreamWrapper stream)
             {
-                m_listener = listener;
-                m_outStream = outputStream;
+                m_stream = stream;
+                m_since = Stopwatch.GetTimestamp();
             }
 
-            internal HttpListener m_listener;
-            internal OutputNetworkStreamWrapper m_outStream;
-
-            // Forwards to waiting function of the listener.
-            internal void AddToWaitingConnections()
-            {
-                m_listener.WaitingConnectionThreadFunc(m_outStream);
-            }
+            internal readonly OutputNetworkStreamWrapper m_stream;
+            internal readonly long m_since;
         }
 
+        // How long GetContext sleeps between two rounds while TLS handshakes are under way, which take a few round trips.
+        private const int HandshakeSleepMilliseconds = 10;
+
+        /// <summary>
+        /// An https connection whose TLS handshake is under way, and since when.
+        /// </summary>
+        private class Handshaking
+        {
+            internal Handshaking(Socket socket, SslStream stream)
+            {
+                m_socket = socket;
+                m_stream = stream;
+                m_since = Stopwatch.GetTimestamp();
+            }
+
+            internal readonly Socket m_socket;
+            internal readonly SslStream m_stream;
+            internal readonly long m_since;
+        }
+
+        /// <summary>
+        /// Advances the TLS handshakes under way with what their clients sent, without waiting: those complete wait for
+        /// a request, those failed or too slow are closed.
+        /// </summary>
+        /// <returns>Whether a handshake completed or was closed.</returns>
+        /// <remarks>Cosmos: nanoFramework's accept thread runs each handshake to its end, which GetContext's thread, the
+        /// one serving every connection, can't wait for.</remarks>
+        private bool CheckHandshakes()
+        {
+            bool changed = false;
+
+            for (int i = m_Handshaking.Count - 1; i >= 0; i--)
+            {
+                Handshaking handshaking = (Handshaking)m_Handshaking[i];
+
+                bool complete = false;
+                bool failed;
+                try
+                {
+                    complete = handshaking.m_stream.AdvanceAuthentication();
+                    failed = !complete && Stopwatch.GetElapsedTime(handshaking.m_since).TotalMilliseconds > ClientReadTimeout;
+                }
+                catch
+                {
+                    // An alert, a certificate, or a client gone.
+                    failed = true;
+                }
+
+                if (complete)
+                {
+                    m_Handshaking.RemoveAt(i);
+                    AddToWaitingConnections(new OutputNetworkStreamWrapper(handshaking.m_socket, handshaking.m_stream));
+                    changed = true;
+                }
+                else if (failed)
+                {
+                    m_Handshaking.RemoveAt(i);
+                    DisposeQuietly(handshaking.m_stream);
+                    changed = true;
+                }
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Adds a connection to those waiting for a request: a new one, or one kept alive after a response.
+        /// </summary>
         internal void AddToWaitingConnections(OutputNetworkStreamWrapper outputStream)
         {
-            // Create a thread that blocks onsocket.Poll - basically waits for new data from client.
-            HttpListernerAndStream listAndSock = new HttpListernerAndStream(this, outputStream);
-
-            // Creates new thread to wait on data
-            Thread thWaitData = new Thread(listAndSock.AddToWaitingConnections);
-            thWaitData.Start();
-        }
-
-        /// <summary>
-        /// Waits for new data from the client.
-        /// </summary>
-        private void WaitingConnectionThreadFunc(OutputNetworkStreamWrapper outputStream)
-        {
-            try
+            // Cosmos: GetContext watches it, where nanoFramework starts a thread to wait for its data. Not once stopped:
+            // nothing would.
+            if (!m_ServiceRunning)
             {
-                // This is a blocking call waiting for more data. 
-                outputStream.m_Socket.Poll(HttpConstants.DefaultKeepAliveMilliseconds * 1000, SelectMode.SelectRead);
-            }
-            catch (Exception ex)
-            {
-                // Poll failed (e.g. connection reset) - outputStream isn't queued anywhere else, so it
-                // must be disposed here or its socket leaks.
-                Debug.WriteLine(ex.Message);
-                outputStream.Dispose();
+                DisposeQuietly(outputStream);
+
+                // Cosmos: on the serving thread, after a Stop from another: the listening socket and the other waiting
+                // connections close with this one.
+                if (OnServingThread)
+                {
+                    CloseListenerSocket();
+                }
+
                 return;
             }
 
-            if (outputStream.m_Socket.Available > 0)
-            {
+            m_WaitingConnections.Add(new WaitingConnection(outputStream));
+        }
 
-                // Add this connected stream to the list.
-                lock (m_InputStreamsQueue)
+        /// <summary>
+        /// Queues the waiting connections whose request has arrived, and closes those the client closed or left idle.
+        /// </summary>
+        /// <returns>Whether a connection was queued or closed.</returns>
+        private bool CheckWaitingConnections()
+        {
+            bool changed = false;
+
+            for (int i = m_WaitingConnections.Count - 1; i >= 0; i--)
+            {
+                WaitingConnection waiting = (WaitingConnection)m_WaitingConnections[i];
+                OutputNetworkStreamWrapper outputStream = waiting.m_stream;
+
+                bool arrived = false;
+                bool closed;
+                try
                 {
-                    m_InputStreamsQueue.Enqueue(outputStream);
+                    // Cosmos: closed by HttpListenerContext.Close or its OutputStream's Close since its response, which
+                    // leaves no stream: nanoFramework's thread then fails on it, a null dereference here (a kernel
+                    // panic on Cosmos, not an exception).
+                    NetworkStream stream = outputStream.m_Stream;
+                    Socket socket = outputStream.m_Socket;
+                    if (stream == null || socket == null)
+                    {
+                        closed = true;
+                    }
+                    else
+                    {
+                        // The stream's DataAvailable: decrypted data, for https. Cosmos: or what the connection's
+                        // reader already took from it, after the previous request.
+                        arrived = outputStream.HasBufferedInput || stream.DataAvailable;
+                        closed = !arrived
+                            && ((socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0)
+                                || Stopwatch.GetElapsedTime(waiting.m_since).TotalMilliseconds > HttpConstants.DefaultKeepAliveMilliseconds);
+                    }
+                }
+                catch
+                {
+                    // A reset, or a TLS alert.
+                    closed = true;
                 }
 
-                // Set event that client stream or exception is added to the queue.
-                m_RequestArrived.Set();
+                if (arrived)
+                {
+                    m_WaitingConnections.RemoveAt(i);
+                    m_InputStreamsQueue.Enqueue(outputStream);
+                    changed = true;
+                }
+                else if (closed)
+                {
+                    m_WaitingConnections.RemoveAt(i);
+                    DisposeQuietly(outputStream);
+                    changed = true;
+                }
             }
-            else // If no data available - means connection was close on other side or timed out.
-            {
-                outputStream.Dispose();
-            }
+
+            return changed;
         }
 
         /// <summary>
@@ -321,148 +441,177 @@ namespace System.Net
         /// </remarks>
         public void Abort()
         {
-            lock (lockObj)
-            {
-                // First we shut down the service.
-                Close();
+            // First we shut down the service.
+            Close();
 
-                // Now we need to go through list of all client sockets and close all of them.
-                // This will cause exceptions on read/write operations on these sockets.
-                foreach (OutputNetworkStreamWrapper netStream in m_ClientStreams)
-                {
-                    netStream.Close();
-                }
-                m_ClientStreams.Clear();
-            }
-
-            if (m_thAccept != null)
+            // Cosmos: closed by the serving thread, when another calls this (see t_served).
+            m_AbortPending = true;
+            if (OnServingThread)
             {
-                m_thAccept.Join();
+                CloseClientStreams();
             }
         }
 
         /// <summary>
-        /// Waits for new connections from the client.
+        /// Cosmos: what a Stop or an Abort from another thread left to the serving thread.
         /// </summary>
-        /// <remarks>On new connections, this method enques the new input
-        /// network stream and sets an event that a new connection is available.
-        /// </remarks>
-        private void AcceptThreadFunc()
+        private void CloseOnServingThread()
         {
-            Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
-            // If there was no exception up to this point, means we succeded to start listening.
-            m_ServiceRunning = true;
-            int retry = 0;
+            CloseListenerSocket();
 
-            // The Start function is waiting on this event. We set it to indicate that
-            // thread that waits for connections is already started.
-            m_RequestArrived.Set();
-
-            // The value of m_serviceStarted normally is changed from other thread by calling Stop.
-            while (m_ServiceRunning)
+            if (m_AbortPending)
             {
-                Socket clientSock;
-                // Need to create NetworkStream or SSL stream depending on protocol used.
-                NetworkStream netStream = null;
+                CloseClientStreams();
+            }
+        }
 
-                try
+        /// <summary>
+        /// Closes the connections whose response is under way.
+        /// </summary>
+        private void CloseClientStreams()
+        {
+            m_AbortPending = false;
+
+            // Now we need to go through list of all client sockets and close all of them.
+            // This will cause exceptions on read/write operations on these sockets.
+            // Cosmos: no accept thread to join, and no lock, which an exception would leave held on a Cosmos kernel.
+            // A stream closed so throws ObjectDisposedException on its next use, where nanoFramework's dereferences null.
+            object[] streams;
+            lock (m_ClientStreams)
+            {
+                streams = m_ClientStreams.ToArray();
+                m_ClientStreams.Clear();
+            }
+
+            foreach (OutputNetworkStreamWrapper netStream in streams)
+            {
+                DisposeQuietly(netStream);
+            }
+        }
+
+        /// <summary>
+        /// Accepts the connection waiting on the listening socket, if any.
+        /// </summary>
+        /// <returns>Whether a connection was accepted.</returns>
+        /// <remarks>Cosmos: what nanoFramework's accept thread does for each connection, called by GetContext. The
+        /// connection then waits for its request with the kept-alive ones, so a client that connects and sends
+        /// nothing, as a browser does ahead of time, doesn't hold the thread.</remarks>
+        private bool AcceptPendingConnection()
+        {
+            Socket listener = m_listener;
+            if (listener == null || !listener.Poll(0, SelectMode.SelectRead))
+            {
+                return false;
+            }
+
+            Socket clientSock;
+            try
+            {
+                clientSock = listener.Accept();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex.Message);
+                return false;
+            }
+
+            // Cosmos: no NoDelay option, which faults on Cosmos's sockets (see Start).
+
+            // Need to create NetworkStream or SSL stream depending on protocol used.
+            NetworkStream netStream = null;
+
+            try
+            {
+                if (!m_IsHttpsConnection)
                 {
-                    // It is important that multithread access to m_listener.Accept(); is not locked.
-                    // If it was locked - then Close or Stop would be blocked potnetially for ever while waiting for connection.
-                    // This is a blocking call waiting for connection.
-                    clientSock = m_listener.Accept();
-
-                    retry = 0;
-                    try
-                    {
-                        // set NoDelay to increase HTTP(s) response times
-                        clientSock.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
-                    }
-                    catch
-                    {
-                        // empty on purpose
-                    }
+                    // This is case of normal HTTP. Create network stream.
+                    netStream = new NetworkStream(clientSock, true);
                 }
-                catch (SocketException)
+                else
                 {
-                    if (++retry > 5)
-                    {
-                        // If request to stop listener flag is set or locking call is interupted return
-                        // On exception we stop the service and record the exception.
-                        if (m_ServiceRunning && !m_Closed)
-                        {
-                            Stop();
-                        }
+                    // This is the case of https.
+                    // Once connection established need to create secure stream and authenticate server.
+                    SslStream sslStream = new SslStream(clientSock);
+                    netStream = sslStream;
+                    netStream.ReadTimeout = ClientReadTimeout;
 
-                        // Set event to unblock thread waiting for accept.
-                        m_RequestArrived.Set();
-
-                        break;
-                    }
-
-                    continue;
-                }
-                catch
-                {
-                    // If request to stop listener flag is set or locking call is interupted return
-                    // On exception we stop the service and record the exception.
-                    if (m_ServiceRunning && !m_Closed)
-                    {
-                        Stop();
-                    }
-
-                    // Set event to unblock thread waiting for accept.
-                    m_RequestArrived.Set();
-
-                    break;
-                }
-
-                try
-                {
-                    if (!m_IsHttpsConnection)
-                    {
-                        // This is case of normal HTTP. Create network stream.
-                        netStream = new NetworkStream(clientSock, true);
-                    }
-                    else
-                    {
-                        // This is the case of https.
-                        // Once connection established need to create secure stream and authenticate server.
-                        netStream = new SslStream(clientSock);
-
-                        // Throws exception if this fails
-                        // pass the server certificate
-                        // do not require client certificate
-                        ((SslStream)netStream).AuthenticateAsServer(m_httpsCert, false, m_sslProtocols);
-
-                        netStream.ReadTimeout = 10000;
-                    }
-                }
-                catch
-                {
-                    if (netStream != null)
-                    {
-                        netStream.Dispose();
-                    }
-                    else
-                    {
-                        clientSock.Close();
-                    }
-
-                    m_RequestArrived.Set();
-
-                    // try again 
-                    continue;
+                    // Throws exception if this fails
+                    // pass the server certificate
+                    // do not require client certificate
+                    // Cosmos: started only; CheckHandshakes goes on with it as the client answers.
+                    sslStream.BeginAuthenticateAsServer(m_httpsCert, m_sslProtocols);
+                    m_Handshaking.Add(new Handshaking(clientSock, sslStream));
+                    return true;
                 }
 
-                // Add this connected stream to the list.
-                lock (m_InputStreamsQueue)
+                // Cosmos: nanoFramework sets it for https only.
+                netStream.ReadTimeout = ClientReadTimeout;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex.Message);
+
+                if (netStream != null)
                 {
-                    m_InputStreamsQueue.Enqueue(new OutputNetworkStreamWrapper(clientSock, netStream));
+                    DisposeQuietly(netStream);
+                }
+                else
+                {
+                    SslNative.CloseSocket(clientSock);
                 }
 
-                // Set event that client stream or exception is added to the queue.
-                m_RequestArrived.Set();
+                return true;
+            }
+
+            AddToWaitingConnections(new OutputNetworkStreamWrapper(clientSock, netStream));
+            return true;
+        }
+
+        private static void DisposeQuietly(IDisposable disposable)
+        {
+            try
+            {
+                disposable.Dispose();
+            }
+            catch
+            {
+                // Closed already, or reset by the client.
+            }
+        }
+
+        /// <summary>
+        /// Closes the listening socket and the connections waiting for a request.
+        /// </summary>
+        private void CloseListenerSocket()
+        {
+            if (Interlocked.Exchange(ref m_ListenerClosed, 1) != 0)
+            {
+                return;
+            }
+
+            Socket listener = m_listener;
+            m_listener = null;
+
+            if (listener != null)
+            {
+                SslNative.CloseSocket(listener);
+            }
+
+            for (int i = 0; i < m_WaitingConnections.Count; i++)
+            {
+                DisposeQuietly(((WaitingConnection)m_WaitingConnections[i]).m_stream);
+            }
+            m_WaitingConnections.Clear();
+
+            for (int i = 0; i < m_Handshaking.Count; i++)
+            {
+                DisposeQuietly(((Handshaking)m_Handshaking[i]).m_stream);
+            }
+            m_Handshaking.Clear();
+
+            while (m_InputStreamsQueue.Count > 0)
+            {
+                DisposeQuietly((OutputNetworkStreamWrapper)m_InputStreamsQueue.Dequeue());
             }
         }
 
@@ -477,79 +626,73 @@ namespace System.Net
         /// </remarks>
         public void Start()
         {
-            lock (lockObj)
+            // Cosmos: no lock (an exception would leave it held on a Cosmos kernel), and no accept thread.
+            if (m_Closed) throw new ObjectDisposedException(nameof(HttpListener));
+
+            // If service was already started, the call has no effect.
+            if (m_ServiceRunning)
             {
-                if (m_Closed) throw new ObjectDisposedException();
+                return;
+            }
 
-                // If service was already started, the call has no effect.
-                if (m_ServiceRunning)
-                {
-                    return;
-                }
+            // Cosmos: a stop the serving thread hasn't carried out yet is undone, its listening socket kept: another
+            // bound to the port would leave that one open for good.
+            if (Volatile.Read(ref m_ListenerClosed) == 0)
+            {
+                m_ServiceRunning = true;
+                return;
+            }
 
-                m_listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
 
-                try
-                {
-                    // set NoDelay to increase HTTP(s) response times
-                    m_listener.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
-                }
-                catch
-                {
-                    // empty on purpose 
-                }
+            // Cosmos: no NoDelay nor ReuseAddress option. Cosmos's sockets have no native handle for SetSocketOption
+            // to reach, and it faults on the null one (a kernel panic, which no catch stops). Cosmos's TCP sends every
+            // write at once and keeps no TIME_WAIT, which leaves those options nothing to do.
 
-                try
-                {
-                    // Start server socket to accept incoming connections.
-                    m_listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                }
-                catch
-                {
-                    // empty on purpose
-                }
+            // Cosmos: nanoFramework's GetDefaultLocalAddress (the device's address) is .NET's Any.
+            IPAddress addr = m_localEndpointIP ?? IPAddress.Any;
 
-                IPAddress addr = m_localEndpointIP ?? IPAddress.GetDefaultLocalAddress();
+            IPEndPoint endPoint = new IPEndPoint(addr, m_Port);
 
-                IPEndPoint endPoint = new IPEndPoint(addr, m_Port);
-                m_listener.Bind(endPoint);
+            try
+            {
+                listener.Bind(endPoint);
 
                 // Starts to listen to maximum of 10 connections.
-                m_listener.Listen(MaxCountOfPendingConnections);
-
-                // Create a thread that blocks on m_listener.Accept() - basically waits for connection from client.
-                m_thAccept = new Thread(AcceptThreadFunc);
-                m_thAccept.Start();
-
-                // Waits for thread that calls Accept to start.
-                m_RequestArrived.WaitOne();
+                listener.Listen(MaxCountOfPendingConnections);
             }
+            catch
+            {
+                SslNative.CloseSocket(listener);
+                throw;
+            }
+
+            m_listener = listener;
+            Interlocked.Exchange(ref m_ListenerClosed, 0);
+            m_ServiceRunning = true;
         }
 
         /// <summary>
-        /// Shuts down the <itemref>HttpListener</itemref> after processing all
-        /// currently queued requests.
+        /// Shuts down the <itemref>HttpListener</itemref>.
         /// </summary>
         /// <remarks>After calling this method, you can no longer use the
         /// <itemref>HttpListener</itemref> object.  To temporarily pause an
         /// <itemref>HttpListener</itemref> object, use the
-        /// <see cref='Stop'/> method.</remarks>
+        /// <see cref='Stop'/> method.
+        /// <para>
+        /// Cosmos: as <see cref="Stop"/>, the requests that arrived but weren't returned by GetContext yet are closed
+        /// unanswered; the one being handled is answered.
+        /// </para>
+        /// </remarks>
         public void Close()
         {
-            lock (lockObj)
+            // close does not throw
+            if (!m_Closed)
             {
-                // close does not throw
-                try
-                {
-                    Stop();
-                }
-                catch
-                {
-                    // empty on purpose to catch any exceptions thrown when calling the Stop above
-                }
-
-                m_Closed = true;
+                Stop();
             }
+
+            m_Closed = true;
         }
 
         /// <summary>
@@ -562,27 +705,25 @@ namespace System.Net
         /// you can use the <see cref='Start'/> method
         /// to restart it.
         /// </para>
+        /// <para>
+        /// Cosmos: called from another thread than the one serving (calling <see cref="GetContext"/>), it leaves the
+        /// sockets to that one: waiting in GetContext, it closes them and returns null within a round (50 ms); handling a
+        /// request, it closes them once the response is closed, or in its next GetContext call, which throws
+        /// InvalidOperationException, or in its own Close.
+        /// </para>
         /// </remarks>
         public void Stop()
         {
-            // Need to lock access to object, because Stop can be called from a
-            // different thread.
-            lock (lockObj)
+            if (m_Closed) throw new ObjectDisposedException(nameof(HttpListener));
+
+            m_ServiceRunning = false;
+
+            // We close the server socket that listen for incoming connection.
+            // Cosmos: and the connections waiting for a request, on the serving thread (see t_served); the request
+            // being handled is answered.
+            if (OnServingThread)
             {
-                if (m_Closed) throw new ObjectDisposedException();
-
-                m_ServiceRunning = false;
-
-                // We close the server socket that listen for incoming connection.
-                // Connections that already accepted are processed.
-                // Connections that has been in queue for server socket, but not accepted, are lost.
-                if (m_listener != null)
-                {
-                    m_listener.Close();
-                    m_listener = null;
-
-                    m_RequestArrived.Set();
-                }
+                CloseListenerSocket();
             }
         }
 
@@ -591,7 +732,7 @@ namespace System.Net
         /// </summary>
         /// <returns>
         /// An <see cref="HttpListenerContext"/> object that
-        /// represents a client request.
+        /// represents a client request, or <see langword="null"/> once the listener is stopped.
         /// </returns>
         /// <exception cref="SocketException">A socket call failed. Check the
         /// exception's ErrorCode property to determine the cause of the exception.</exception>
@@ -599,6 +740,11 @@ namespace System.Net
         /// currently stopped or The HttpListener does not have any Uniform Resource Identifier
         /// (URI) prefixes to respond to.</exception>
         /// <exception cref="ObjectDisposedException">This object is closed.</exception>
+        /// <remarks>
+        /// Cosmos: the connections are accepted, and the TLS handshakes run, on the thread that calls this method,
+        /// which must be the one using the contexts it returns. It sleeps when nothing is pending, so it must not be
+        /// a Cosmos kernel's main loop.
+        /// </remarks>
         /// <example>This example shows how to call the
         /// <itemref>GetContext</itemref> method.
         /// <code>
@@ -615,35 +761,53 @@ namespace System.Net
         /// </example>
         public HttpListenerContext GetContext()
         {
-            // Protects access for simultaneous call for GetContext and Close or Stop.
-            lock (lockObj)
-            {
-                if (m_Closed) throw new ObjectDisposedException();
+            if (m_Closed) throw new ObjectDisposedException(nameof(HttpListener));
 
-                if (!m_ServiceRunning) throw new InvalidOperationException();
+            // Cosmos: this thread serves the listener (see t_served).
+            t_served = this;
+            m_HasServingThread = true;
+
+            if (!m_ServiceRunning)
+            {
+                // Cosmos: stopped from another thread while this one served a request: the sockets are its to close.
+                CloseOnServingThread();
+                throw new InvalidOperationException("The listener is not started.");
             }
 
             // Try to get context until service is running.
-            while (m_ServiceRunning)
+            HttpListenerContext context = null;
+            while (m_ServiceRunning && context == null)
             {
                 // Before waiting for event we need to look for pending connections.
-                lock (m_InputStreamsQueue)
+                if (m_InputStreamsQueue.Count > 0)
                 {
-                    if (m_InputStreamsQueue.Count > 0)
+                    OutputNetworkStreamWrapper outputStreamWrap = m_InputStreamsQueue.Dequeue() as OutputNetworkStreamWrapper;
+                    if (outputStreamWrap != null)
                     {
-                        OutputNetworkStreamWrapper outputStreamWrap = m_InputStreamsQueue.Dequeue() as OutputNetworkStreamWrapper;
-                        if (outputStreamWrap != null)
-                        {
-                            return new HttpListenerContext(outputStreamWrap, this);
-                        }
+                        context = new HttpListenerContext(outputStreamWrap, this);
                     }
+
+                    continue;
                 }
 
-                // Waits for new connection to arrive on new or existing socket.
-                m_RequestArrived.WaitOne();
+                // Cosmos: what the accept thread and the waiting threads do on nanoFramework.
+                bool busy = AcceptPendingConnection();
+                busy |= CheckHandshakes();
+                busy |= CheckWaitingConnections();
+
+                if (!busy && m_InputStreamsQueue.Count == 0)
+                {
+                    Thread.Sleep(m_Handshaking.Count > 0 ? HandshakeSleepMilliseconds : IdleSleepMilliseconds);
+                }
             }
 
-            return null;
+            // Stopped from another thread: the sockets are this thread's to close.
+            if (!m_ServiceRunning)
+            {
+                CloseOnServingThread();
+            }
+
+            return context;
         }
 
         /// <summary>

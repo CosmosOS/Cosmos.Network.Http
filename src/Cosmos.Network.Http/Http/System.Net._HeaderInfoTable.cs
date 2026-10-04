@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System.Collections;
 
@@ -66,7 +66,10 @@ namespace System.Net
                 tempCollection.Add(singleValue.Trim());
             }
 
-            return (string[])tempCollection.ToArray(typeof(string));
+            // Cosmos: ArrayList.ToArray(Type) makes the array by reflection, which NativeAOT may not have compiled.
+            string[] values = new string[tempCollection.Count];
+            tempCollection.CopyTo(values);
+            return values;
         }
 
         /// <summary>

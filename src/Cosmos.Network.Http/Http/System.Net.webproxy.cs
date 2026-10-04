@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Contains HTTP proxy settings for the <see cref="WebRequest"/>

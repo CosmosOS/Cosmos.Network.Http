@@ -6,7 +6,7 @@
 
 using System.Diagnostics;
 
-namespace System.Net.Http.Headers
+namespace Cosmos.Network.Http.Headers
 {
     internal sealed partial class KnownHeader
     {

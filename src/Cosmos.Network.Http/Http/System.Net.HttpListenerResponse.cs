@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System;
     using System.IO;
@@ -48,6 +48,26 @@ namespace System.Net
         /// in both the request and the response.
         /// </summary>
         private bool m_KeepAlive = false;
+
+        /// <summary>
+        /// Cosmos: whether Close handed the connection to the listener to wait for its next request, which
+        /// HttpListenerContext.Close then leaves open.
+        /// </summary>
+        internal bool m_KeptAlive;
+
+        /// <summary>
+        /// Cosmos: the request's method, set once it is parsed: the response to a HEAD request has no body.
+        /// </summary>
+        internal string m_RequestMethod;
+
+        /// <summary>
+        /// Cosmos: whether the response has no body whatever its headers say (RFC 9112, 6.3): one to a HEAD request,
+        /// or a 1xx, 204 or 304 one.
+        /// </summary>
+        private bool IsBodiless => m_RequestMethod == "HEAD"
+            || (m_ResponseStatusCode >= 100 && m_ResponseStatusCode < 200)
+            || m_ResponseStatusCode == (int)HttpStatusCode.NoContent
+            || m_ResponseStatusCode == (int)HttpStatusCode.NotModified;
 
         /// <summary>
         /// Encoding for this response's OutputStream.
@@ -110,7 +130,8 @@ namespace System.Net
         internal HttpListenerResponse(OutputNetworkStreamWrapper clientStream, HttpListener httpListener)
         {
             // Sets the delegate, so SendHeaders will be called on first write.
-            clientStream.HeadersDelegate = new OutputNetworkStreamWrapper.SendHeadersDelegate(SendHeaders);
+            // Cosmos: and forgets the chunked encoding of a previous response on a kept-alive connection.
+            clientStream.StartResponse(new OutputNetworkStreamWrapper.SendHeadersDelegate(SendHeaders));
             // Saves network stream as member.
             m_clientStream = clientStream;
             // Saves list of client streams. m_clientStream is removed from clientStreamsList during Close().
@@ -124,6 +145,26 @@ namespace System.Net
         /// </summary>
         private void PrepareHeaders()
         {
+            if (IsBodiless)
+            {
+                // Cosmos: no chunk, not even the last one, which the next response on the connection would start with.
+                m_sendChunked = false;
+                m_clientStream.m_enableChunkedEncoding = false;
+            }
+            else if (!m_sendChunked && m_ContentLength == -1)
+            {
+                // Cosmos: a body neither sized nor chunked ends with the connection: closed after it, where
+                // nanoFramework said Keep-Alive and the client waited for an end that never came.
+                m_KeepAlive = false;
+            }
+
+            // Cosmos: a request whose body the handler left unread closes its connection (see Dispose), which the
+            // client is told now rather than finding it closed.
+            if (m_clientStream.m_Input != null && !m_clientStream.m_Input.IsBodyRead)
+            {
+                m_KeepAlive = false;
+            }
+
             // Adds content length if it was present.
             if (m_ContentLength != -1)
             {
@@ -188,11 +229,19 @@ namespace System.Net
             // SendHeaders() again.
             m_clientStream.HeadersDelegate = null;
 
+            // Cosmos: closed by its OutputStream's Close, or by an Abort: an exception, where nanoFramework dereferences
+            // null, a kernel panic on Cosmos.
+            NetworkStream stream = m_clientStream.m_Stream;
+            if (stream == null)
+            {
+                throw new ObjectDisposedException(nameof(HttpListenerResponse));
+            }
+
             // Creates encoder, generates headers and sends the data.
             Encoding encoder = Encoding.UTF8;
 
             byte[] statusLine = encoder.GetBytes(ComposeHTTPResponse());
-            m_clientStream.m_Stream.Write(statusLine, 0, statusLine.Length);
+            stream.Write(statusLine, 0, statusLine.Length);
 
             // Prepares/Updates WEB header collection.
             PrepareHeaders();
@@ -201,7 +250,7 @@ namespace System.Net
             byte[] pHeaders = m_httpResponseHeaders.ToByteArray();
 
             // Sends the headers
-            m_clientStream.m_Stream.Write(pHeaders, 0, pHeaders.Length);
+            stream.Write(pHeaders, 0, pHeaders.Length);
 
             m_WasResponseSent = true;
         }
@@ -268,7 +317,11 @@ namespace System.Net
         /// </summary>
         /// <value><itemref>true</itemref> if the server requests a persistent
         /// connection; otherwise, <itemref>false</itemref>.  The default is
-        /// <itemref>true</itemref>.</value>
+        /// <itemref>false</itemref> (nanoFramework's).</value>
+        /// <remarks>
+        /// Cosmos: kept only if the response turns out whole (its Content-Length written, its last chunk sent, or no
+        /// body) and the request's body was read; a body neither sized nor chunked ends with the connection.
+        /// </remarks>
         public bool KeepAlive
         {
             get { return m_KeepAlive; }
@@ -433,11 +486,17 @@ namespace System.Net
                         SendHeaders();
                     }
                 }
-                finally
+                catch
                 {
-                    // Removes from the list of streams and closes the socket.
+                    // Cosmos: in a catch, as a finally block doesn't run while an exception unwinds through it on a
+                    // Cosmos kernel: a client gone before its response would leave its socket open. Not kept alive.
+                    m_KeepAlive = false;
                     ((IDisposable)this).Dispose();
+                    throw;
                 }
+
+                // Removes from the list of streams and closes the socket.
+                ((IDisposable)this).Dispose();
             }
         }
 
@@ -470,24 +529,49 @@ namespace System.Net
 
             if (disposing)
             {
-                try
+                // Iterates over list of client connections and remove its stream from it.
+                m_Listener.RemoveClientStream(m_clientStream);
+
+                // Cosmos: the stream is gone once the OutputStream was closed, which closes the connection; nanoFramework
+                // flushed it anyway, a null dereference (a kernel panic on Cosmos, not an exception).
+                bool open = m_clientStream.m_Stream != null;
+                if (open)
                 {
-                    // Iterates over list of client connections and remove its stream from it.
-                    m_Listener.RemoveClientStream(m_clientStream);
-
-                    m_clientStream.m_Stream.Flush();
-
-                    // If KeepAlive is true,
-                    if (m_KeepAlive)
-                    {   // Then socket is tramsferred to the list of waiting for new data.
-                        m_Listener.AddToWaitingConnections(m_clientStream);
+                    try
+                    {
+                        // Cosmos: ends a chunked response.
+                        m_clientStream.FinishChunks();
+                        m_clientStream.m_Stream?.Flush();
                     }
-                    else  // If not KeepAlive then close
+                    catch
+                    {
+                        // The client is gone.
+                        open = false;
+                    }
+                }
+
+                // Cosmos: kept alive only once both messages are whole: the response sent as its headers said (its
+                // Content-Length written, its last chunk sent, or no body), and the request's body read, so the next
+                // request starts where its bytes do. Otherwise the client would wait for the rest, or the server read
+                // the body as a request; and not once Abort was called.
+                bool responseWhole = IsBodiless
+                    || (m_sendChunked ? m_clientStream.ChunksFinished : m_ContentLength >= 0 && m_clientStream.m_BodyWritten == m_ContentLength);
+                bool requestRead = m_clientStream.m_Input == null || m_clientStream.m_Input.IsBodyRead;
+
+                // If KeepAlive is true,
+                if (open && m_KeepAlive && responseWhole && requestRead && !m_Listener.m_AbortPending)
+                {   // Then socket is tramsferred to the list of waiting for new data.
+                    m_Listener.AddToWaitingConnections(m_clientStream);
+                    m_KeptAlive = true;
+                }
+                else  // If not KeepAlive then close
+                {
+                    try
                     {
                         m_clientStream.Dispose();
                     }
+                    catch { }
                 }
-                catch { }
             }
             else
             {

@@ -6,7 +6,7 @@
 
 using System.Net.Sockets;
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Provides access to the networkStream and socket for creating a websocket

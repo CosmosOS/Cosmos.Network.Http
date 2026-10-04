@@ -5,11 +5,11 @@
 //
 
 using System.IO;
-using System.Net.Http.Headers;
+using Cosmos.Network.Http.Headers;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Initializes a new instance of the HttpClient class.
@@ -17,8 +17,8 @@ namespace System.Net.Http
     /// <remarks>
     /// The HttpClient class instance acts as a session to send HTTP requests.
     /// An HttpClient instance is a collection of settings applied to all requests executed by that instance.
-    /// In addition, every HttpClient instance uses its own connection pool,
-    /// isolating its requests from requests executed by other HttpClient instances.
+    /// Cosmos: the connections kept alive are pooled for every instance (HttpWebRequest's), each for a server and the
+    /// TLS settings it was authenticated with.
     ///
     /// HttpClient is intended to be instantiated once and reused throughout the life of an application.
     /// </remarks>
@@ -80,8 +80,9 @@ namespace System.Net.Http
         /// The timespan to wait before the request times out.
         /// </value>
         /// <remarks>
-        /// <para>The default value is 100,000 milliseconds (100 seconds).</para>
-        /// <para>To set an infinite timeout, set the property value to <see cref="Threading.Timeout.InfiniteTimeSpan"/>.</para>
+        /// <para>Cosmos: the default value is infinite, as nanoFramework's constructor sets it, so each read may wait for the
+        /// 5 minutes of HttpWebRequest.ReadWriteTimeout. A value bounds each wait for the response's head and for its body.</para>
+        /// <para>To set an infinite timeout, set the property value to <see cref="System.Threading.Timeout.InfiniteTimeSpan"/>.</para>
         /// <para>
         /// A Domain Name System (DNS) query may take up to 15 seconds to return or time out. If your request contains a host name that requires resolution and you set <see cref="Timeout"/> to a value less than 15 seconds, it may take 15 seconds or more before a <see cref="WebException"/> is thrown to indicate a timeout on your request.
         /// </para>
@@ -98,7 +99,7 @@ namespace System.Net.Http
 
             set
             {
-                if (value != Threading.Timeout.InfiniteTimeSpan && (value <= TimeSpan.Zero || value.TotalMilliseconds > int.MaxValue))
+                if (value != System.Threading.Timeout.InfiniteTimeSpan && (value <= TimeSpan.Zero || value.TotalMilliseconds > int.MaxValue))
                 {
                     throw new ArgumentOutOfRangeException();
                 }
@@ -146,7 +147,7 @@ namespace System.Net.Http
             new HttpClientHandler(),
             true)
         {
-            _timeout = Threading.Timeout.InfiniteTimeSpan;
+            _timeout = System.Threading.Timeout.InfiniteTimeSpan;
 
             // The default in REST API is to close the connection after each request.
             DefaultRequestHeaders.ConnectionClose = true;
@@ -290,10 +291,7 @@ namespace System.Net.Http
         /// </remarks>
         public byte[] GetByteArray(string requestUri)
         {
-            using var resp = Get(requestUri, HttpCompletionOption.ResponseContentRead);
-            resp.EnsureSuccessStatusCode();
-
-            return resp.Content.ReadAsByteArray();
+            return ReadContent(Get(requestUri, HttpCompletionOption.ResponseContentRead));
         }
 
         /// <summary>
@@ -319,10 +317,9 @@ namespace System.Net.Http
         /// </remarks>
         public Stream GetStream(string requestUri)
         {
-            var resp = Get(requestUri, HttpCompletionOption.ResponseHeadersRead);
-            resp.EnsureSuccessStatusCode();
-
-            return resp.Content.ReadAsStream();
+            // Cosmos: the body read into memory, as ReadAsStream reads it, and the response disposed, which nanoFramework
+            // never did: its connection stayed open, and a Cosmos kernel runs no finalizer to close it.
+            return new MemoryStream(ReadContent(Get(requestUri, HttpCompletionOption.ResponseContentRead)), false);
         }
 
         /// <summary>
@@ -346,10 +343,22 @@ namespace System.Net.Http
         /// </remarks>
         public string GetString(string requestUri)
         {
-            using HttpResponseMessage resp = Get(requestUri, HttpCompletionOption.ResponseContentRead);
-            resp.EnsureSuccessStatusCode();
+            HttpResponseMessage resp = Get(requestUri, HttpCompletionOption.ResponseContentRead);
+            string content;
+            try
+            {
+                resp.EnsureSuccessStatusCode();
+                content = resp.Content.ReadAsString();
+            }
+            catch
+            {
+                // Cosmos: see ReadContent.
+                resp.Dispose();
+                throw;
+            }
 
-            return resp.Content.ReadAsString();
+            resp.Dispose();
+            return content;
         }
 
         #region Advanced Send Overloads
@@ -438,10 +447,49 @@ namespace System.Net.Http
             // Read the content when default HttpCompletionOption.ResponseContentRead is set
             if (response.Content != null && completionOption == HttpCompletionOption.ResponseContentRead)
             {
-                response.Content.LoadIntoBuffer();
+                try
+                {
+                    response.Content.LoadIntoBuffer();
+                }
+                catch (Exception e)
+                {
+                    // Cosmos: the response disposed, as nobody gets it to dispose, and the failure reported as Send's
+                    // others are.
+                    response.Dispose();
+
+                    if (e is HttpRequestException)
+                    {
+                        throw;
+                    }
+
+                    throw new HttpRequestException("An error occurred while reading the response", e);
+                }
             }
 
             return response;
+        }
+
+        /// <summary>
+        /// Cosmos: the body of a successful response, which is then disposed. nanoFramework's using statement disposes it
+        /// in a finally block, which a Cosmos kernel skips while an exception unwinds: a failed status would leave the
+        /// connection open.
+        /// </summary>
+        private static byte[] ReadContent(HttpResponseMessage resp)
+        {
+            byte[] content;
+            try
+            {
+                resp.EnsureSuccessStatusCode();
+                content = resp.Content.ReadAsByteArray();
+            }
+            catch
+            {
+                resp.Dispose();
+                throw;
+            }
+
+            resp.Dispose();
+            return content;
         }
 
         #endregion
@@ -477,7 +525,7 @@ namespace System.Net.Http
         {
             if (_disposed)
             {
-                throw new ObjectDisposedException();
+                throw new ObjectDisposedException(nameof(HttpClient));
             }
         }
 

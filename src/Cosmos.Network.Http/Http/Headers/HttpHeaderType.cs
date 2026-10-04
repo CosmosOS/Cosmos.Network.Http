@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net.Http.Headers
+namespace Cosmos.Network.Http.Headers
 {
     [Flags]
     internal enum HttpHeaderType : byte

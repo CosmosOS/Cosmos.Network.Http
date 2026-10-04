@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net.Http.Http.Headers
+namespace Cosmos.Network.Http.Headers
 {
     /// <summary>
     /// Represents a media type used in a Content-Type header as defined in the RFC 2616.
@@ -90,26 +90,18 @@ namespace System.Net.Http.Http.Headers
             // assume it's MediaType
             value = new MediaTypeHeaderValue(tempValue);
 
-            if (values.Length > 1 && values.Length <= 2)
+            // Cosmos: the charset among any parameters, its name in any case, as .NET reads them; the others (boundary,
+            // name...) and empty ones (a trailing ';') skipped, where nanoFramework threw FormatException for anything
+            // but one lowercase charset: a server's "text/html; Charset=utf-8" could not be read.
+            for (int i = 1; i < values.Length; i++)
             {
                 // remove leading and trailing spaces
-                tempValue = values[1].Trim(' ');
+                tempValue = values[i].Trim(' ');
 
-                // assume 2nd part, if present is charset
-                int indexOfCharSet = tempValue.IndexOf(_CharSetLabel);
-
-                // check for misplaced start of charset
-                if (indexOfCharSet != 0)
+                if (tempValue.StartsWith(_CharSetLabel, StringComparison.OrdinalIgnoreCase))
                 {
-                    throw new FormatException();
+                    value.CharSet = tempValue.Substring(_CharSetLabelLenght).Trim(' ', '"');
                 }
-
-                value.CharSet = tempValue.Substring(indexOfCharSet + _CharSetLabelLenght);
-            }
-
-            if (values.Length > 2)
-            {
-                throw new FormatException();
             }
 
             return value;

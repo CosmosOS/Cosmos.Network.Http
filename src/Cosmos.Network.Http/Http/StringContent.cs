@@ -4,10 +4,10 @@
 // See LICENSE file in the project root for full license information.
 //
 
-using System.Net.Http.Http.Headers;
+using Cosmos.Network.Http.Headers;
 using System.Text;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Provides HTTP content based on a string.

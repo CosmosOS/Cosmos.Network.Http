@@ -6,7 +6,7 @@
 
 using System.IO;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Provides HTTP content based on a byte array.

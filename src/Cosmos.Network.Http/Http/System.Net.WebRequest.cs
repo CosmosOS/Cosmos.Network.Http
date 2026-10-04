@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System;
     using System.Collections;
@@ -58,6 +58,12 @@ namespace System.Net
             {
                 g_listLock = new object();
                 s_PrefixList = new ArrayList();
+
+                // Cosmos: http and https, which HttpWebRequest's static constructor registers on nanoFramework, where
+                // every static constructor runs at startup. .NET runs it on HttpWebRequest's first use, so Create would
+                // throw NotSupportedException before any.
+                RegisterPrefix("http:");
+                RegisterPrefix("https:");
             }
         }
 

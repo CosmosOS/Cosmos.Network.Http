@@ -1,32 +1,35 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
+    .NET nanoFramework's System.Net.Http (https://github.com/nanoframework/System.Net.Http),
+    its folder tree kept, ported to Cosmos Gen3 in the Cosmos.Network.Http namespace.
     A plain .NET library, like Cosmos.Network.Ftp: it uses System.Net.Sockets
     and nothing from Cosmos. A Cosmos Gen3 kernel runs it on the kernel's
     network stack through the socket and DNS plugs, and on a desktop it runs
     as is, which is how the tests drive it.
-
-    TLS is BouncyCastle's, all managed code: SslStream and the BCL's
-    cryptography call OpenSSL, which a kernel does not have.
   -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
-    <Nullable>enable</Nullable>
+    <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <IsAotCompatible>true</IsAotCompatible>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <RootNamespace>Cosmos.Network.Http</RootNamespace>
+    <!-- Properties/AssemblyInfo.cs (nanoFramework's) sets these. -->
+    <GenerateAssemblyTitleAttribute>false</GenerateAssemblyTitleAttribute>
+    <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+    <GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
   </PropertyGroup>
 
   <PropertyGroup>
     <PackageId>Cosmos.Network.Http</PackageId>
-    <Version>2.1.0</Version>
+    <Version>3.0.0</Version>
     <Title>Cosmos.Network.Http</Title>
     <Authors>Cosmos</Authors>
     <Company>Cosmos</Company>
-    <Description>HTTP client for Cosmos Gen3 kernels.</Description>
-    <PackageTags>cosmos;http;https;tls;client;kernel</PackageTags>
+    <Description>HTTP client and server for Cosmos Gen3 kernels, https included: .NET nanoFramework's System.Net.Http (HttpClient, HttpListener, HttpWebRequest) on Cosmos's sockets, with TLS 1.3 and 1.2 by BouncyCastle.</Description>
+    <PackageTags>cosmos;http;https;tls;client;server;httpclient;httplistener;nanoframework;kernel</PackageTags>
     <PackageIcon>icon.png</PackageIcon>
     <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -39,6 +42,24 @@
     <None Include="../../THIRD-PARTY-NOTICES.txt" Pack="true" PackagePath="/" />
     <None Include="../../README.md" Pack="true" PackagePath="/" />
     <None Include="../../resources/icon.png" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <!--
+    nanoFramework's sources declare System.Net, System.Net.Http, System.Net.Http.Headers and System.Web,
+    renamed Cosmos.Network.Http and Cosmos.Network.Http.Headers so they don't clash with the BCL's types.
+    Inside System.Net they saw System and System.Net without a using: imported here instead.
+  -->
+  <ItemGroup>
+    <Using Include="System" />
+    <Using Include="System.Net" />
+    <!-- SslProtocols: nanoFramework's System.Net.Security one is .NET's, with the same values. -->
+    <Using Include="System.Security.Authentication" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- nanoFramework's own System.Uri: .NET has one. -->
+    <Compile Remove="Http/System.Uri.cs" />
+    <None Include="Http/System.Uri.cs" />
   </ItemGroup>
 
   <ItemGroup>

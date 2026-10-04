@@ -1,6 +1,6 @@
 ﻿using System.IO;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// A wrapper stream that provides read-only access to an underlying stream.
@@ -86,7 +86,7 @@ namespace System.Net.Http
         public override void Flush() => throw new NotSupportedException();
 
         /// <inheritdoc />
-        public override int Read(SpanByte buffer)
+        public override int Read(Span<byte> buffer)
         {
             return _innerStream.Read(buffer);
         }

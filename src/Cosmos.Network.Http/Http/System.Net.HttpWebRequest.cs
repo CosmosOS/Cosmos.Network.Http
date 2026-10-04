@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net
+namespace Cosmos.Network.Http
 {
     using System;
     using System.Collections;
@@ -56,11 +56,9 @@ namespace System.Net
         /// </summary>
         internal static ArrayList m_ConnectedStreams;
 
-        /// <summary>
-        /// Timer that checks on open connections and closes them if they are
-        /// idle for a long time.
-        /// </summary>
-        static Timer m_DropOldConnectionsTimer;
+        // Cosmos: no timer to drop the connections left idle (nanoFramework's m_DropOldConnectionsTimer): each new
+        // connection drops them first. A Timer runs its callback on thread pool threads, whose stacks a Cosmos kernel
+        // never frees, and against sockets the request thread uses, which Cosmos's network stack doesn't lock.
 
         /// <summary>
         /// If a response was created then Dispose on the Request will not dispose the underlying stream.
@@ -81,6 +79,7 @@ namespace System.Net
             if (count > 0)
             {
                 DateTime curTime = DateTime.UtcNow;
+                ArrayList expired = null;
 
                 lock (m_ConnectedStreams)
                 {
@@ -90,6 +89,12 @@ namespace System.Net
                     {
                         InputNetworkStreamWrapper streamWrapper = (InputNetworkStreamWrapper)m_ConnectedStreams[i];
 
+                        // Cosmos: not one in use, whose m_lastUsed tells when it was lent, not when it was last used.
+                        if (streamWrapper.m_InUse)
+                        {
+                            continue;
+                        }
+
                         TimeSpan timePassed = curTime - streamWrapper.m_lastUsed;
 
                         // If the socket is old, then close and remove from the list.
@@ -97,19 +102,32 @@ namespace System.Net
                         {
                             m_ConnectedStreams.RemoveAt(i);
 
-                            // Closes the socket to release resources.
-                            streamWrapper.Dispose();
+                            (expired ??= new ArrayList()).Add(streamWrapper);
                         }
                     }
 
-                    // Keep the timer going for another DefaultKeepAliveMilliseconds if we still have persistent connections in m_ConnectedStreams.  
-                    // Otherwise, do nothing.  The timer won't be fired again.
-                    if (m_ConnectedStreams.Count > 0)
-                    {
-                        m_DropOldConnectionsTimer.Change(HttpConstants.DefaultKeepAliveMilliseconds, System.Threading.Timeout.Infinite);
-                    }
-
                 }
+
+                // Cosmos: closed out of the lock, which a Cosmos kernel doesn't release while an exception unwinds.
+                for (int i = 0; expired != null && i < expired.Count; i++)
+                {
+                    // Closes the socket to release resources.
+                    DisposeQuietly((InputNetworkStreamWrapper)expired[i]);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Cosmos: disposes a pooled connection, which may be closed or reset already.
+        /// </summary>
+        private static void DisposeQuietly(InputNetworkStreamWrapper stream)
+        {
+            try
+            {
+                stream.Dispose();
+            }
+            catch
+            {
             }
         }
 
@@ -133,7 +151,6 @@ namespace System.Net
             {
                 // Creates new list for connected sockets.
                 m_ConnectedStreams = new ArrayList();
-                m_DropOldConnectionsTimer = new Timer(CheckPersistentConnections, null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
             }
         }
 
@@ -399,7 +416,7 @@ namespace System.Net
         /// One of the values defined in the <see cref="Security.SslProtocols"/> enumeration.
         /// </value>
         /// <remarks>
-        /// Setting this property is mandatory when performing HTTPS requests, otherwise the authentication will fail.
+        /// Cosmos: SslProtocols.None (the default) offers TLS 1.3 and 1.2; nanoFramework required a value for HTTPS.
         /// 
         /// This property is specific to nanoFramework. There is no equivalent in the .NET API.
         /// </remarks>
@@ -1284,7 +1301,9 @@ namespace System.Net
                 }
             }
 
-            m_httpRequestHeaders.ChangeInternal(HttpKnownHeaderNames.Host, m_originalUrl.Host);
+            // Cosmos: the authority, with a port other than the scheme's (RFC 9112, 3.2), where nanoFramework sends the host
+            // alone: a server on port 8080 would read port 80.
+            m_httpRequestHeaders.ChangeInternal(HttpKnownHeaderNames.Host, m_originalUrl.Authority);
 
             // Adds user name and password for basic Http authentication.
             if (m_NetworkCredentials != null && m_NetworkCredentials.AuthenticationType == AuthenticationType.Basic)
@@ -1337,26 +1356,33 @@ namespace System.Net
         {
             InputNetworkStreamWrapper retStream = null;
 
+            // Cosmos: what nanoFramework's m_DropOldConnectionsTimer does.
+            CheckPersistentConnections(null);
+
             // Create a socket and set reuse true.
             // But before creating new socket we look in the list of existing sockets. If socket for this host already
             // exist - use it. No need to create new socket.
             string remoteServer = targetServer.Host + ":" + targetServer.Port;
+            string connectionKey = ConnectionKey(targetServer);
+            ArrayList removeStreamList = new ArrayList();
             lock (m_ConnectedStreams)
             {
-                ArrayList removeStreamList = new ArrayList();
 
                 for (int i = 0; i < m_ConnectedStreams.Count; i++)
                 {
                     InputNetworkStreamWrapper inputStream = (InputNetworkStreamWrapper)m_ConnectedStreams[i];
 
-                    if (inputStream.m_rmAddrAndPort == remoteServer && !inputStream.m_InUse)
+                    if (inputStream.m_rmAddrAndPort == connectionKey && !inputStream.m_InUse)
                     {
                         // Re-use the connected socket.
                         // But first we need to know that socket is not closed.
                         try
                         {
                             // Non-blocking liveness check: Available == 0 after a ready SelectRead poll means the peer closed the connection.
-                            bool peerClosed = inputStream.m_Socket.Poll(0, SelectMode.SelectRead) && inputStream.m_Socket.Available == 0;
+                            // Cosmos: and one no longer connected is dead too: Cosmos's Poll says nothing of a socket
+                            // closed on this side, and one the peer closed is not connected even with data left.
+                            bool peerClosed = !inputStream.m_Socket.Connected
+                                || (inputStream.m_Socket.Poll(0, SelectMode.SelectRead) && inputStream.m_Socket.Available == 0);
                             if (!peerClosed)
                             {
                                 // No exception, good we can condtinue and re-use connected stream.
@@ -1386,9 +1412,13 @@ namespace System.Net
 
                     // Means socket was closed. Remove it from the list.
                     m_ConnectedStreams.Remove(removeStream);
-
-                    removeStream.Dispose();
                 }
+            }
+
+            // Cosmos: closed out of the lock, which a Cosmos kernel doesn't release while an exception unwinds.
+            for (int i = 0; i < removeStreamList.Count; i++)
+            {
+                DisposeQuietly((InputNetworkStreamWrapper)removeStreamList[i]);
             }
 
             if (retStream == null)
@@ -1398,7 +1428,11 @@ namespace System.Net
                 UriHostNameType hostNameType = proxyServer.HostNameType;
                 if (hostNameType == UriHostNameType.IPv4)
                 {
-                    address = IPAddress.Parse(proxyServer.Host);
+                    // Cosmos: TryParse, as Cosmos's IPAddress.Parse returns null rather than throwing.
+                    if (!IPAddress.TryParse(proxyServer.Host, out address))
+                    {
+                        throw new WebException("Invalid IPv4 address: " + proxyServer.Host, WebExceptionStatus.NameResolutionFailure);
+                    }
                 }
                 else if (hostNameType == UriHostNameType.Dns)
                 {
@@ -1413,11 +1447,15 @@ namespace System.Net
                         throw new WebException("host not available", se, WebExceptionStatus.ConnectFailure, null);
                     }
 
+                    // Cosmos: the first IPv4 address, as nanoFramework's resolver returns no other; .NET's may list IPv6
+                    // ones first, which an IPv4 socket can't reach.
                     int addressListSize = hostEntry.AddressList.Length;
                     for (int i = 0; i < addressListSize; i++)
                     {
-                        if ((address = hostEntry.AddressList[i]) != null)
+                        IPAddress candidate = hostEntry.AddressList[i];
+                        if (candidate != null && candidate.AddressFamily == AddressFamily.InterNetwork)
                         {
+                            address = candidate;
                             break;
                         }
                     }
@@ -1436,33 +1474,9 @@ namespace System.Net
                 Socket socket = null;
                 socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
 
-                try
-                {
-                    socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                }
-                catch (Exception)
-                {
-                    // We can safely ignore exceptions
-                }
-
-                try
-                {
-                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
-                }
-                catch (Exception)
-                {
-                    // We can safely ignore exceptions
-                }
-
-                try
-                {
-                    socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, m_keepAlive);
-                }
-                catch (Exception)
-                {
-                    // We can safely ignore exceptions
-                }
-
+                // Cosmos: no ReuseAddress, NoDelay nor KeepAlive option. Cosmos's sockets have no native handle for
+                // SetSocketOption to reach, and it faults on the null one (a kernel panic, which no catch stops).
+                // Cosmos's TCP sends every write at once and keeps no TIME_WAIT, which leaves those options nothing to do.
 
                 // Connect to remote endpoint
                 try
@@ -1470,8 +1484,10 @@ namespace System.Net
                     IPEndPoint remoteEP = new IPEndPoint(address, proxyServer.Port);
                     socket.Connect((EndPoint)remoteEP);
                 }
-                catch (SocketException e)
+                catch (Exception e)
                 {
+                    // Cosmos: any exception, as Cosmos's Connect throws a plain Exception where .NET throws a
+                    // SocketException.
                     // need to close socket, otherwise this will cause an out of memory exception
                     socket.Close();
 
@@ -1522,14 +1538,24 @@ namespace System.Net
                         retStream.m_Stream = sslStream;
 
                         // Changes the address. Originally socket was connected to proxy, now as if it connected to m_originalUrl.Host on m_originalUrl.Port
-                        retStream.m_rmAddrAndPort = m_originalUrl.Host + ":" + m_originalUrl.Port;
+                        // Cosmos: with the TLS settings it was authenticated with (see ConnectionKey).
+                        retStream.m_rmAddrAndPort = ConnectionKey(m_originalUrl);
                     }
-                    catch
+                    catch (Exception e)
                     {
                         // Proxy CONNECT failure or SSL handshake failure: retStream is not usable and
                         // isn't referenced anywhere else yet, so it must be closed here or the socket leaks.
                         retStream.Dispose();
-                        throw;
+
+                        // Cosmos: a failed handshake as a WebException, which HttpClient reports as an
+                        // HttpRequestException, where nanoFramework let SslStream's exception through.
+                        if (e is WebException)
+                        {
+                            throw;
+                        }
+
+                        throw new WebException("The TLS connection to " + m_originalUrl.Host + " failed: " + e.Message, e,
+                            e is AuthenticationException ? WebExceptionStatus.TrustFailure : WebExceptionStatus.SecureChannelFailure, null);
                     }
                 }
 
@@ -1539,17 +1565,58 @@ namespace System.Net
                     lock (m_ConnectedStreams)
                     {
                         m_ConnectedStreams.Add(retStream);
-
-                        // if the current stream list was empty then start the timer that drops unused connections.
-                        if (m_ConnectedStreams.Count == 1)
-                        {
-                            m_DropOldConnectionsTimer.Change(HttpConstants.DefaultKeepAliveMilliseconds, System.Threading.Timeout.Infinite);
-                        }
                     }
                 }
             }
 
             return retStream;
+        }
+
+        /// <summary>
+        /// Cosmos: throws for a response ParseHTTPResponse couldn't read, which has no headers: nanoFramework went on with
+        /// it, to a null dereference (a kernel panic on Cosmos, not an exception).
+        /// </summary>
+        private static void ThrowIfMalformed(CoreResponseData respData)
+        {
+            if (respData.m_status != WebExceptionStatus.Success || respData.m_headers == null)
+            {
+                throw new WebException(respData.m_exceptionMessage ?? "The response couldn't be read.", respData.m_innerException, WebExceptionStatus.ServerProtocolViolation, null);
+            }
+        }
+
+        /// <summary>
+        /// Cosmos: what a pooled connection serves: a host and port, and for https the TLS settings it was authenticated
+        /// with, so that a request doesn't reuse a connection another request trusted under other certificates or
+        /// verification. nanoFramework's pool tells them by host and port only.
+        /// </summary>
+        private string ConnectionKey(Uri server)
+        {
+            string key = server.Host + ":" + server.Port;
+
+            if (server.Scheme == Uri.UriSchemeHttps || server.Scheme == Uri.UriSchemeWss)
+            {
+                key += " tls " + (int)m_sslProtocols + " " + (int)_sslVerification + " " + CertificateKey(m_caCert);
+            }
+
+            return key;
+        }
+
+        private static string CertificateKey(X509Certificate certificate)
+        {
+            byte[] raw = certificate?.GetRawCertData();
+            if (raw == null)
+            {
+                return "store";
+            }
+
+            // FNV-1a: the certificates' content, as each request may come with its own instance of the same one.
+            uint hash = 2166136261;
+            for (int i = 0; i < raw.Length; i++)
+            {
+                hash = (hash ^ raw[i]) * 16777619;
+            }
+
+            return raw.Length + "/" + hash.ToString("x8");
         }
 
         /// <summary>
@@ -1690,7 +1757,8 @@ namespace System.Net
             ret.m_statusCode = statusCode;
 
             // Advance to the status message.  The message is optional
-            for (; currentOffset < line.Length && ' ' != line[currentOffset]; ++currentOffset) ;
+            // Cosmos: past the space, where nanoFramework's loop stopped on it: the reason phrase began with it.
+            for (; currentOffset < line.Length && ' ' == line[currentOffset]; ++currentOffset) ;
             ret.m_statusDescription = line.Substring(currentOffset);
 
             ret.m_headers = new WebHeaderCollection(true);
@@ -1813,25 +1881,51 @@ namespace System.Net
                 // reset the total response bytes for the new request.
                 m_requestStream.m_BytesLeftInResponse = -1;
 
-                // create the request timeout timer.  This will kill the operation if it takes longer than specified by the Timeout property.  
-                // The underlying socket will be closed to end the web request
-                using (Timer tmr = new Timer(new TimerCallback(OnRequestTimeout), null, m_timeout, System.Threading.Timeout.Infinite))
+                // Cosmos: the Timeout bounds each wait for the response's head, in place of nanoFramework's timer that closes
+                // the socket from another thread once it elapses (a Timer runs on thread pool threads, whose stacks a
+                // Cosmos kernel never frees, and Cosmos's network stack has no locks). The head comes in time or the
+                // read throws.
+                int readTimeout = m_requestStream.ReadTimeout;
+                if (m_timeout != System.Threading.Timeout.Infinite && (readTimeout == System.Threading.Timeout.Infinite || m_timeout < readTimeout))
+                {
+                    m_requestStream.ReadTimeout = m_timeout;
+                }
+
                 {
                     // Processes response from server. Request stream should already be there.
 
-                    respData = ParseHTTPResponse(m_requestStream, m_keepAlive);
+                    // Cosmos: a new response on the connection, so a clone made before (GetRequestStream's) gives back
+                    // nothing over it when disposed (InputNetworkStreamWrapper.TakeReadState).
+                    m_requestStream.StartResponse();
 
-                    if (respData.m_statusCode == (int)HttpStatusCode.Continue)
+                    respData = ParseHTTPResponse(m_requestStream, m_keepAlive);
+                    ThrowIfMalformed(respData);
+
+                    // Cosmos: every interim response (1xx but 101) handed to the continue delegate, if any, and skipped,
+                    // where nanoFramework skipped one 100 Continue, and none with a delegate: a 103 Early Hints would
+                    // have been the response, and the real one read by the next request on the connection.
+                    while (respData.m_statusCode >= 100 && respData.m_statusCode < 200 && respData.m_statusCode != (int)HttpStatusCode.SwitchingProtocols)
                     {
                         if (m_continueDelegate != null)
                         {
                             m_continueDelegate(respData.m_statusCode, respData.m_headers);
                         }
-                        else
-                        {
-                            respData = ParseHTTPResponse(m_requestStream, m_keepAlive);
-                        }
+
+                        respData = ParseHTTPResponse(m_requestStream, m_keepAlive);
+                        ThrowIfMalformed(respData);
                     }
+                }
+
+                m_requestStream.ReadTimeout = readTimeout;
+
+                // Cosmos: a response that has no body whatever its headers say (RFC 9112, 6.3): reading one would wait
+                // for bytes that never come on a kept-alive connection.
+                // 101 excepted: the connection is the new protocol's (a WebSocket's) after it.
+                int status = respData.m_statusCode;
+                if (m_method == "HEAD" || status == (int)HttpStatusCode.NoContent || status == (int)HttpStatusCode.NotModified)
+                {
+                    m_requestStream.m_BytesLeftInResponse = 0;
+                    respData.m_chunked = false;
                 }
 
                 response = new HttpWebResponse(m_method, m_originalUrl, respData, this);
@@ -1845,35 +1939,36 @@ namespace System.Net
                 m_responseStatus = response.StatusCode;
 
                 m_responseCreated = true;
-                m_requestStream.m_InUse = false;  // Persistent connections are not yet supported, but they wouldn't work without this.
-            }
-            catch (SocketException se)
-            {
-                if (m_requestStream != null)
-                {
-                    m_requestStream.m_InUse = false;
 
-                    if (m_requestStream.m_Socket != null)
-                    {
-                        this.m_requestStream.m_Socket.Close();
-                    }
-                }
-                throw new WebException("GetResponse() failed", se);
+                // Cosmos: the connection stays in use until the response is disposed, which releases it once its body is
+                // read (InputNetworkStreamWrapper.ReleaseStream). nanoFramework lent it to the next request now, which
+                // would then read what is left of this response's body.
             }
             catch (Exception e)
             {
-                // Same cleanup as above: without it, any failure between the connection being
-                // established and the response being fully constructed (bad status line, malformed
-                // headers, a throwing continue-delegate, etc.) leaks the connection/socket.
+                // Without it, any failure between the connection being established and the response being fully
+                // constructed (bad status line, malformed headers, a throwing continue-delegate, etc.) leaks the
+                // connection/socket.
+                // Cosmos: the connection out of the pool too, as nanoFramework closed its socket only: Cosmos's Poll
+                // says a closed socket has nothing to read, so the pool would lend it to every later request.
                 if (m_requestStream != null)
                 {
-                    m_requestStream.m_InUse = false;
+                    RemoveStreamFromPool(m_requestStream);
 
-                    if (m_requestStream.m_Socket != null)
+                    try
                     {
-                        this.m_requestStream.m_Socket.Close();
+                        m_requestStream.Dispose();
+                    }
+                    catch
+                    {
                     }
                 }
+
+                if (e is WebException)
+                {
+                    throw;
+                }
+
                 throw new WebException("GetResponse() failed", e);
             }
 

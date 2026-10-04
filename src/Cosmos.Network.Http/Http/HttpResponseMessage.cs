@@ -4,9 +4,9 @@
 // See LICENSE file in the project root for full license information.
 //
 
-using System.Net.Http.Headers;
+using Cosmos.Network.Http.Headers;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Represents a HTTP response message including the status code and data.
@@ -194,7 +194,7 @@ namespace System.Net.Http
         {
             if (_disposed)
             {
-                throw new ObjectDisposedException();
+                throw new ObjectDisposedException(nameof(HttpResponseMessage));
             }
         }
     }

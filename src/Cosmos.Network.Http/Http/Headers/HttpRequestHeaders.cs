@@ -6,7 +6,7 @@
 
 using System.Diagnostics;
 
-namespace System.Net.Http.Headers
+namespace Cosmos.Network.Http.Headers
 {
     /// <summary>
     /// Represents the collection of Request Headers as defined in RFC 2616.
@@ -48,15 +48,9 @@ namespace System.Net.Http.Headers
 
             set
             {
-                var connectionHeader = _headerStore.GetValues(HttpKnownHeaderNames.Connection);
-                if (connectionHeader is not null)
-                {
-                    connectionHeader[0] = value ? "close" : "keep-alive";
-                }
-                else
-                {
-                    _headerStore.AddInternal(HttpKnownHeaderNames.Connection, value ? "close" : "keep-alive");
-                }
+                // Cosmos: replaces the header. nanoFramework sets the first element of the array GetValues returns, a
+                // copy, so a Connection header set once (HttpClient's constructor sets close) could never change.
+                _headerStore.ChangeInternal(HttpKnownHeaderNames.Connection, value ? "close" : "keep-alive");
             }
         }
 

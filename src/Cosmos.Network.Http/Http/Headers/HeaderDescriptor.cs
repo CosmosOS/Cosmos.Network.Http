@@ -4,7 +4,7 @@
 // See LICENSE file in the project root for full license information.
 //
 
-namespace System.Net.Http.Headers
+namespace Cosmos.Network.Http.Headers
 {
     // This struct represents a particular named header --
     // if the header is one of our known headers, then it contains a reference to the KnownHeader object;

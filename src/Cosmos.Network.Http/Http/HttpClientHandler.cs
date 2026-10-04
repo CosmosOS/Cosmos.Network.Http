@@ -4,11 +4,11 @@
 // See LICENSE file in the project root for full license information.
 //
 
-using System.Net.Http.Headers;
+using Cosmos.Network.Http.Headers;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 
-namespace System.Net.Http
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// The default message handler used by HttpClient in .NET nanoFramework.
@@ -204,7 +204,7 @@ namespace System.Net.Http
         {
             if (_disposed)
             {
-                throw new ObjectDisposedException();
+                throw new ObjectDisposedException(nameof(HttpClientHandler));
             }
 
             var webRequest = CreateWebRequest(request);
@@ -256,16 +256,26 @@ namespace System.Net.Http
 
                 wresponse = (HttpWebResponse)webRequest.GetResponse();
             }
-            catch (WebException we)
+            catch (Exception ex)
             {
-                if (we.Status != WebExceptionStatus.RequestCanceled)
+                // Cosmos: any failure, as Cosmos's sockets throw plain exceptions, with the request's connection closed
+                // here, as nothing else will. nanoFramework let other exceptions through, and returned a response
+                // without one for a canceled request (a null dereference, a kernel panic on Cosmos).
+                try
                 {
-                    throw new HttpRequestException("An error occurred while sending the request", we);
+                    webRequest.Dispose();
                 }
-            }
-            catch (IO.IOException ex)
-            {
+                catch
+                {
+                }
+
                 throw new HttpRequestException("An error occurred while sending the request", ex);
+            }
+
+            if (wresponse == null)
+            {
+                webRequest.Dispose();
+                throw new HttpRequestException("The request got no response.");
             }
 
             try
@@ -321,6 +331,13 @@ namespace System.Net.Http
             if (_timeout != TimeSpan.Zero)
             {
                 wr.Timeout = (int)_timeout.TotalMilliseconds;
+
+                // Cosmos: the body's reads too, which wait ReadWriteTimeout (5 minutes) otherwise, on a Cosmos kernel's
+                // UI thread as often as not.
+                if (wr.Timeout != System.Threading.Timeout.Infinite && wr.Timeout < wr.ReadWriteTimeout)
+                {
+                    wr.ReadWriteTimeout = wr.Timeout;
+                }
             }
 
             wr.SslProtocols = _sslProtocols;

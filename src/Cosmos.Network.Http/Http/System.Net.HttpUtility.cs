@@ -6,7 +6,7 @@
 
 using System.Text;
 
-namespace System.Web
+namespace Cosmos.Network.Http
 {
     /// <summary>
     /// Utilities to encode and decode URLs.
