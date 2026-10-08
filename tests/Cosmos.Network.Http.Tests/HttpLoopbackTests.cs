@@ -28,6 +28,7 @@ namespace Cosmos.Network.Http.Tests
             private readonly List<Exception> _errors = new List<Exception>();
             private int _taken;
             private int _handled;
+            private volatile bool _restarting;
 
             internal TestServer(bool https = false, SslProtocols protocols = SslProtocols.Tls12)
             {
@@ -55,6 +56,22 @@ namespace Cosmos.Network.Http.Tests
 
             internal void Start() => _listener.Start();
 
+            // Stop then Start with the serving thread held back: seeing the Stop between the two, it would return from
+            // GetContext, close the listener and leave Start to throw.
+            internal void Restart()
+            {
+                _restarting = true;
+                try
+                {
+                    _listener.Stop();
+                    _listener.Start();
+                }
+                finally
+                {
+                    _restarting = false;
+                }
+            }
+
             private void Serve()
             {
                 while (_listener.IsListening)
@@ -62,6 +79,12 @@ namespace Cosmos.Network.Http.Tests
                     HttpListenerContext context = _listener.GetContext();
                     if (context == null)
                     {
+                        if (_restarting)
+                        {
+                            SpinWait.SpinUntil(() => !_restarting);
+                            continue;
+                        }
+
                         break;
                     }
 
@@ -818,8 +841,7 @@ namespace Cosmos.Network.Http.Tests
             Assert.AreEqual("Hello, Cosmos", client.GetString(server.Url("/hello")));
 
             // From this thread, before the serving one acts on the Stop: undone.
-            server.Stop();
-            server.Start();
+            server.Restart();
 
             Thread.Sleep(200);
             Assert.AreEqual("Hello, Cosmos", client.GetString(server.Url("/hello")));
