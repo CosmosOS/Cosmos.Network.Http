@@ -1379,8 +1379,8 @@ namespace Cosmos.Network.Http
                         try
                         {
                             // Non-blocking liveness check: Available == 0 after a ready SelectRead poll means the peer closed the connection.
-                            // Cosmos: and one no longer connected is dead too: Cosmos's Poll says nothing of a socket
-                            // closed on this side, and one the peer closed is not connected even with data left.
+                            // Cosmos: and one no longer connected is dead too: on Cosmos, one the peer closed is not
+                            // connected even with data left.
                             bool peerClosed = !inputStream.m_Socket.Connected
                                 || (inputStream.m_Socket.Poll(0, SelectMode.SelectRead) && inputStream.m_Socket.Available == 0);
                             if (!peerClosed)
@@ -1949,8 +1949,8 @@ namespace Cosmos.Network.Http
                 // Without it, any failure between the connection being established and the response being fully
                 // constructed (bad status line, malformed headers, a throwing continue-delegate, etc.) leaks the
                 // connection/socket.
-                // Cosmos: the connection out of the pool too, as nanoFramework closed its socket only: Cosmos's Poll
-                // says a closed socket has nothing to read, so the pool would lend it to every later request.
+                // Cosmos: the connection out of the pool too, where nanoFramework closed its socket only and left it to
+                // the pool's liveness check.
                 if (m_requestStream != null)
                 {
                     RemoveStreamFromPool(m_requestStream);

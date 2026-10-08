@@ -3,7 +3,7 @@
 // Cosmos kernel: its SecureRandom draws from .NET's RandomNumberGenerator, which Cosmos plugs with a kernel CSPRNG.
 // One instance is one SSL context and its session; SslStream holds it where nanoFramework holds a context handle.
 // BouncyCastle runs non-blocking here: what the socket holds is offered to it and what it produces is sent, so every
-// wait is NetworkStream's (Cosmos's sockets don't wait themselves).
+// wait is the socket's, in Poll.
 
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -226,7 +226,7 @@ namespace Cosmos.Network.Http
 
         private bool StepHandshake()
         {
-            Socket socket = _transport._socket;
+            Socket socket = _transport.Socket;
 
             while (!_protocol.IsConnected)
             {
@@ -240,7 +240,8 @@ namespace Cosmos.Network.Http
                 int available = socket.Available;
                 if (available == 0)
                 {
-                    // Read before Poll, as in NetworkStream.WaitForData.
+                    // Read before Poll, as Cosmos's network stack takes in packets meanwhile: a message and the
+                    // peer's FIN arriving after Poll leave the socket not connected, with the message still to read.
                     bool connected = socket.Connected;
                     if (socket.Poll(0, SelectMode.SelectRead))
                     {
@@ -353,7 +354,7 @@ namespace Cosmos.Network.Http
         internal int DataAvailable()
         {
             // What has arrived is decrypted first: nanoFramework's native layer does it as data comes in.
-            Socket socket = _transport._socket;
+            Socket socket = _transport.Socket;
 
             int available;
             while (!_protocol.IsClosed && !_inputClosed && (available = socket.Available) > 0)
@@ -383,7 +384,7 @@ namespace Cosmos.Network.Http
             try
             {
                 // Not to a peer that has closed the connection: Cosmos's Send would throw.
-                if (_protocol != null && !_protocol.IsClosed && _transport._socket.Connected)
+                if (_protocol != null && !_protocol.IsClosed && _transport.Socket.Connected)
                 {
                     _protocol.Close();
                     SendOutput();
@@ -394,7 +395,7 @@ namespace Cosmos.Network.Http
                 // The peer may be gone already; the socket is closed all the same.
             }
 
-            CloseSocket(_transport._socket);
+            CloseSocket(_transport.Socket);
         }
 
         /// <summary>
@@ -499,13 +500,23 @@ namespace Cosmos.Network.Http
 
         private int Receive(int timeout)
         {
-            int available = _transport.WaitForData(timeout);
+            Socket socket = _transport.Socket;
+
+            // Waits in Poll rather than in Receive, which the socket's ReceiveTimeout bounds: the handshake bounds the
+            // whole of it, with what is left of its timeout.
+            if (!socket.Poll(timeout == Timeout.Infinite ? -1 : (int)Math.Min(timeout * 1000L, int.MaxValue), SelectMode.SelectRead))
+            {
+                throw new IOException("Nothing was received for " + timeout + " ms.", new SocketException((int)SocketError.TimedOut));
+            }
+
+            // Readable with nothing to read: the peer closed the connection.
+            int available = socket.Available;
             if (available == 0)
             {
                 return 0;
             }
 
-            return ReceiveAvailable(_transport._socket, available);
+            return ReceiveAvailable(socket, available);
         }
 
         private int ReceiveAvailable(Socket socket, int available)
@@ -557,7 +568,7 @@ namespace Cosmos.Network.Http
             byte[] output = new byte[count];
             count = _protocol.ReadOutput(output, 0, count);
 
-            Socket socket = _transport._socket;
+            Socket socket = _transport.Socket;
             int sent = 0;
             while (sent < count)
             {
