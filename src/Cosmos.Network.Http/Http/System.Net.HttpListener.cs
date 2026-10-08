@@ -249,8 +249,8 @@ namespace Cosmos.Network.Http
 
         // Cosmos: nanoFramework accepts on a thread of its own, waits for a kept-alive connection's next request on a
         // thread per connection blocked in Socket.Poll, and wakes GetContext with an AutoResetEvent. On a Cosmos kernel
-        // Socket.Poll doesn't wait, a thread's stack is never freed, the network stack has no locks, and two threads
-        // throwing at once halt the kernel (a failed TLS handshake throws). So the thread in GetContext does it all: it
+        // a thread's stack is never freed, the network stack has no locks, and two threads throwing at once halt the
+        // kernel (a failed TLS handshake throws). So the thread in GetContext does it all: it
         // accepts, runs the TLS handshakes and watches the connections waiting for a request, and no other thread
         // touches the sockets.
 

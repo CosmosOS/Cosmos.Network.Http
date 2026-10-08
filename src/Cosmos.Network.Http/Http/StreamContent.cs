@@ -97,7 +97,7 @@ namespace Cosmos.Network.Http
 
                     if (read == 0 && !isDone)
                     {
-                        // Cosmos: no more. The Cosmos NetworkStream's Read waits for data itself and returns 0 only once
+                        // Cosmos: no more. .NET's NetworkStream's Read waits for data itself and returns 0 only once
                         // the connection is closed, which nanoFramework's sleep here would then wait on forever (on a
                         // Cosmos kernel's main thread, which must never sleep). A body cut short throws in Read
                         // (InputNetworkStreamWrapper.ThrowIfCutShort).

@@ -134,7 +134,7 @@ namespace Cosmos.Network.Http
             m_dataStart = m_dataEnd = 0;
             // Read up to read_buffer_size, but less data can be read.
             // This function does not try to block, so it reads available data or 1 byte at least.
-            int readCount = (int)m_Stream.Length;
+            int readCount = ReadableLength(m_Stream);
             if (readCount > read_buffer_size)
             {
                 readCount = read_buffer_size;
@@ -147,6 +147,15 @@ namespace Cosmos.Network.Http
             m_dataEnd = m_Stream.Read(m_readBuffer, 0, readCount);
 
             return m_dataEnd;
+        }
+
+        /// <summary>
+        /// Cosmos: what nanoFramework's NetworkStream.Length is, the number of bytes the stream can return without
+        /// waiting, where .NET's Length throws: what the socket holds, or the decrypted bytes of an SslStream.
+        /// </summary>
+        private static int ReadableLength(NetworkStream stream)
+        {
+            return stream is SslStream ? (int)stream.Length : stream.Socket.Available;
         }
 
         /// <summary>
@@ -253,16 +262,15 @@ namespace Cosmos.Network.Http
         {
             byte[] buffer = new byte[1024];
 
-            // Cosmos: drops what can be read without waiting. nanoFramework waits up to a second in Socket.Poll for
-            // more, which Cosmos's Poll doesn't do, and reads the socket's Available, which counts encrypted bytes for
-            // https and would leave Read waiting for a record that never comes; the stream's Length counts what it
-            // can return.
+            // Cosmos: drops what can be read without waiting, where nanoFramework waits up to a second in Socket.Poll
+            // for more and reads the socket's Available, which counts encrypted bytes for https and would leave Read
+            // waiting for a record that never comes; ReadableLength counts what the stream can return.
             // What was read ahead belongs to the response.
             if (m_BytesLeftInResponse > 0) m_BytesLeftInResponse -= Math.Min(m_dataEnd - m_dataStart, m_BytesLeftInResponse);
 
             try
             {
-                int avail = (int)m_Stream.Length;
+                int avail = ReadableLength(m_Stream);
 
                 while (avail > 0)
                 {
@@ -272,7 +280,7 @@ namespace Cosmos.Network.Http
 
                     if (m_BytesLeftInResponse > 0) m_BytesLeftInResponse -= bytes;
 
-                    avail = (int)m_Stream.Length;
+                    avail = ReadableLength(m_Stream);
                 }
             }
             catch
@@ -511,7 +519,7 @@ namespace Cosmos.Network.Http
         /// </summary>
         /// <returns>The length of the data available on the stream. 
         /// Add data cached in the stream buffer to available on socket</returns>
-        public override long Length { get { return m_EnableChunkedDecoding && m_chunk != null ? m_chunk.m_Size : m_Stream.Length + m_dataEnd - m_dataStart; } }
+        public override long Length { get { return m_EnableChunkedDecoding && m_chunk != null ? m_chunk.m_Size : ReadableLength(m_Stream) + m_dataEnd - m_dataStart; } }
 
         /// <summary>
         /// Position is not supported for NetworkStream

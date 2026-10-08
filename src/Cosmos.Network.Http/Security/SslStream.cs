@@ -7,7 +7,8 @@
 // nanoFramework's System.Net SslStream (nanoFramework.System.Net/Security/SslStream.cs). Cosmos: the TLS that
 // nanoFramework runs natively (SslNative, mbedTLS) is BouncyCastle's managed TLS, in SslNative.cs: .NET's SslStream
 // needs OpenSSL, which a Cosmos kernel doesn't have. Each native call becomes a call to the SslNative object the
-// stream holds in place of nanoFramework's SSL context handle.
+// stream holds in place of nanoFramework's SSL context handle. It derives from .NET's NetworkStream, which Cosmos
+// plugs, where nanoFramework's derives from its own.
 
 using System.IO;
 using System.Net.Sockets;
@@ -31,6 +32,9 @@ namespace Cosmos.Network.Http
         // Cosmos: the TLS session, null where nanoFramework's native context handle is -1.
         private SslNative _sslContext;
         private bool _isServer;
+
+        // Cosmos: nanoFramework's NetworkStream has it, .NET's keeps its own private.
+        private bool _disposed;
 
         /// <summary>
         /// Option for SSL verification.
@@ -357,8 +361,11 @@ namespace Cosmos.Network.Http
                 }
                 else
                 {
-                    SslNative.CloseSocket(_socket);
+                    SslNative.CloseSocket(Socket);
                 }
+
+                // Cosmos: .NET's NetworkStream marks itself disposed too; it doesn't own the socket, closed above.
+                base.Dispose(disposing);
             }
         }
 
